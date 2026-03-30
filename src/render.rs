@@ -66,12 +66,9 @@ pub fn render(state: &State, rows: usize, cols: usize) {
 
     println!();
     println!(
-        "{}{} j/k{} nav  {}{} enter{} go  {}{} space{} star  {}{} esc{} close{}",
+        "{0}{1} j/k{2} nav  {0}{1} enter{2} go  {0}{1} space{2} star  \
+         {0}{1} h/l{2} fold  {0}{1} 1-9{2} jump  {0}{1} esc{2} close{2}",
         fg(accent), BOLD, RESET,
-        fg(accent), BOLD, RESET,
-        fg(accent), BOLD, RESET,
-        fg(accent), BOLD, RESET,
-        RESET,
     );
 }
 
@@ -80,7 +77,12 @@ pub fn render(state: &State, rows: usize, cols: usize) {
 // ---------------------------------------------------------------------------
 
 enum VisualItem<'a> {
-    TabHeader { name: &'a str, active: bool },
+    TabHeader {
+        name: &'a str,
+        active: bool,
+        collapsed: bool,
+        entry_count: usize,
+    },
     Entry(usize, &'a PaneEntry),
 }
 
@@ -94,15 +96,29 @@ fn render_grouped(state: &State, list_rows: usize, cols: usize) -> usize {
     let mut prev_tab: Option<usize> = None;
     let active_tab = state.tabs.iter().find(|t| t.active).map(|t| t.position);
 
+    // Count entries per tab for collapsed headers
+    let mut tab_counts: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    for entry in entries.iter() {
+        *tab_counts.entry(entry.tab_index).or_insert(0) += 1;
+    }
+
     for (i, entry) in entries.iter().enumerate() {
         if prev_tab != Some(entry.tab_index) {
+            let collapsed = state.collapsed_tabs.contains(&entry.tab_index);
+            let count = tab_counts.get(&entry.tab_index).copied().unwrap_or(0);
             items.push(VisualItem::TabHeader {
                 name: &entry.tab_name,
                 active: active_tab == Some(entry.tab_index),
+                collapsed,
+                entry_count: count,
             });
             prev_tab = Some(entry.tab_index);
         }
-        items.push(VisualItem::Entry(i, entry));
+        // Skip entries for collapsed tabs
+        if !state.collapsed_tabs.contains(&entry.tab_index) {
+            items.push(VisualItem::Entry(i, entry));
+        }
     }
 
     // Find visual position of selected entry
@@ -123,11 +139,26 @@ fn render_grouped(state: &State, list_rows: usize, cols: usize) -> usize {
 
     for item in items.iter().skip(start).take(visible) {
         match item {
-            VisualItem::TabHeader { name, active } => {
-                if *active {
-                    println!("{}{}▸ {}{}", fg(accent), BOLD, name, RESET);
+            VisualItem::TabHeader {
+                name,
+                active,
+                collapsed,
+                entry_count,
+            } => {
+                if *collapsed {
+                    if *active {
+                        println!(
+                            "{}{}▸ {} {}({}){}", fg(accent), BOLD, name, fg(muted), entry_count, RESET
+                        );
+                    } else {
+                        println!(
+                            "{}▸ {} ({}){}", fg(muted), name, entry_count, RESET
+                        );
+                    }
+                } else if *active {
+                    println!("{}{}▾ {}{}", fg(accent), BOLD, name, RESET);
                 } else {
-                    println!("{}  {}{}", fg(muted), name, RESET);
+                    println!("{}▾ {}{}", fg(muted), name, RESET);
                 }
             }
             VisualItem::Entry(i, entry) => {
@@ -226,13 +257,17 @@ fn render_entry(
         line.push_str(" \u{2502} "); // │
     }
 
-    // Title / project name
+    // Title / project name / process name
     let max_label = if show_tab { 24 } else { 30 };
     if let Some(ref session) = entry.session {
         let label = session
             .project_name
             .as_deref()
             .unwrap_or(&entry.title);
+        // Orange name when running, default bold when idle/done
+        if session.activity.is_running() {
+            line.push_str(&fg("#ff851b"));
+        }
         line.push_str(BOLD);
         line.push_str(&truncate(label, max_label));
         line.push_str(RESET);
@@ -253,8 +288,23 @@ fn render_entry(
             }
         }
     } else {
-        let max_title = if show_tab { 36 } else { 42 };
-        line.push_str(&truncate(&entry.title, max_title));
+        // Non-Claude pane: show running_command prominently, then dim title
+        let max_title: usize = if show_tab { 36 } else { 42 };
+        if let Some(ref cmd) = entry.running_command {
+            line.push_str(&fg("#a9b1d6"));
+            line.push_str(BOLD);
+            line.push_str(cmd);
+            line.push_str(RESET);
+            if selected {
+                line.push_str(REVERSE);
+            }
+            line.push(' ');
+            line.push_str(DIM);
+            line.push_str(&truncate(&entry.title, max_title.saturating_sub(cmd.len() + 1)));
+            line.push_str(RESET);
+        } else {
+            line.push_str(&truncate(&entry.title, max_title));
+        }
     }
 
     line.push_str(RESET);

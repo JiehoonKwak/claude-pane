@@ -1,10 +1,11 @@
+mod filter;
 mod render;
 mod star;
 mod state;
 #[cfg(test)]
 mod tests;
 
-use state::{strip_activity_prefix, Activity, Config, HookPayload, NotificationFlash, State};
+use state::{Activity, Config, HookPayload, NotificationFlash, State};
 
 #[cfg(target_arch = "wasm32")]
 use zellij_tile::prelude::*;
@@ -52,7 +53,6 @@ impl ZellijPlugin for State {
         match event {
             Event::PaneUpdate(manifest) => {
                 self.pane_manifest = manifest.panes;
-                self.discover_zjstatus();
                 self.track_focus();
                 self.rebuild_pane_map();
                 self.prune_dead_sessions();
@@ -97,6 +97,7 @@ impl ZellijPlugin for State {
             self.visible = true;
             self.search_query.clear();
             self.selected_index = 0;
+            filter::refresh_running_commands(self);
             self.refresh_filtered();
         }
         render::render(self, rows, cols);
@@ -132,10 +133,17 @@ impl State {
                 self.hide_palette();
                 true
             }
+            "star-next" | "claude-pane:star-next" => {
+                self.focus_starred_pane(true);
+                false
+            }
+            "star-prev" | "claude-pane:star-prev" => {
+                self.focus_starred_pane(false);
+                false
+            }
             "dump-state" | "claude-pane:dump-state" => {
                 let mut out = String::new();
-                out.push_str(&format!("own_pane_id={:?} zjstatus_id={:?}\n",
-                    self.own_pane_id, self.zjstatus_plugin_id));
+                out.push_str(&format!("own_pane_id={:?}\n", self.own_pane_id));
                 for t in &self.tabs {
                     out.push_str(&format!("tab: pos={} name={:?} active={}\n", t.position, t.name, t.active));
                 }
@@ -146,8 +154,8 @@ impl State {
                     }
                 }
                 for (id, s) in &self.sessions {
-                    out.push_str(&format!("session: pane={} activity={:?} tab_idx={:?} project={:?}\n",
-                        id, s.activity, s.tab_index, s.project_name));
+                    out.push_str(&format!("session: pane={} activity={:?} tab_idx={:?} tab_name={:?} project={:?}\n",
+                        id, s.activity, s.tab_index, s.tab_name, s.project_name));
                 }
                 let home = std::env::var("HOME").unwrap_or_default();
                 let path = format!("{home}/.config/zellij/plugins/claude-pane-dump.txt");
@@ -301,25 +309,15 @@ impl State {
             self.update_zjstatus();
         }
 
-        let interval = if any_flash_active { 0.5 } else { 1.0 };
+        let has_highlights = !self.focus_highlights.is_empty();
+        let interval = if any_flash_active || has_highlights {
+            0.1
+        } else {
+            1.0
+        };
         set_timeout(interval);
 
         self.visible
-    }
-
-    fn discover_zjstatus(&mut self) {
-        for panes in self.pane_manifest.values() {
-            for pane in panes {
-                if pane.is_plugin {
-                    if let Some(ref url) = pane.plugin_url {
-                        if url.contains("zjstatus") {
-                            self.zjstatus_plugin_id = Some(pane.id);
-                            return;
-                        }
-                    }
-                }
-            }
-        }
     }
 
     fn update_zjstatus(&mut self) {
@@ -329,33 +327,11 @@ impl State {
         }
         self.last_zjstatus_update = now;
 
-        // Pick highest-priority activity per tab
-        let mut tab_activity: std::collections::HashMap<usize, Activity> =
-            std::collections::HashMap::new();
-        for session in self.sessions.values() {
-            if let Some(tab_idx) = session.tab_index {
-                let dominated = tab_activity
-                    .get(&tab_idx)
-                    .map(|cur| session.activity.priority() > cur.priority())
-                    .unwrap_or(true);
-                if dominated {
-                    tab_activity.insert(tab_idx, session.activity);
-                }
-            }
-        }
-
-        for tab in &self.tabs {
-            // Strip any existing activity symbol prefix to get base name
-            let base = strip_activity_prefix(&tab.name);
-            let new_name = if let Some(activity) = tab_activity.get(&tab.position) {
-                format!("{} {}", activity.symbol(), base)
-            } else {
-                base.to_string()
-            };
-
-            if tab.name != new_name {
-                rename_tab(tab.position as u32, &new_name);
-            }
+        // Pipe status to zjstatus via CLI (same protocol as zellij pipe)
+        if self.config.zjstatus_pipe {
+            let status = state::format_zjstatus(&self.sessions);
+            let msg = format!("zjstatus::pipe::pipe_status::{}", status);
+            exec_cmd(&["zellij", "pipe", &msg]);
         }
     }
 
@@ -367,6 +343,25 @@ impl State {
                     if self.current_focus_pane != Some(new_focus) {
                         self.previous_focus_pane = self.current_focus_pane;
                         self.current_focus_pane = Some(new_focus);
+                        // Clear notification when user focuses the pane
+                        if let Some(session) = self.sessions.get_mut(&new_focus) {
+                            if session.flash_deadline > 0.0
+                                || session.focus_highlight_deadline > 0.0
+                            {
+                                session.flash_deadline = 0.0;
+                                session.focus_highlight_deadline = 0.0;
+                                set_pane_color(
+                                    PaneId::Terminal(new_focus),
+                                    None,
+                                    None,
+                                );
+                            }
+                            // Clear attention activity on focus (acknowledged)
+                            if session.activity.is_attention() {
+                                session.activity = Activity::Thinking;
+                                self.update_zjstatus();
+                            }
+                        }
                     }
                     return;
                 }
@@ -378,6 +373,7 @@ impl State {
         self.visible = true;
         self.search_query.clear();
         self.selected_index = 0;
+        filter::refresh_running_commands(self);
         self.refresh_filtered();
         show_self(true);
     }
@@ -386,6 +382,56 @@ impl State {
         self.visible = false;
         self.search_query.clear();
         hide_self();
+    }
+
+    fn focus_starred_pane(&mut self, forward: bool) {
+        let pane_id = if forward {
+            self.stars.next()
+        } else {
+            self.stars.prev()
+        };
+        if let Some(pane_id) = pane_id {
+            for (&tab_idx, panes) in &self.pane_manifest {
+                for pane in panes {
+                    if pane.id == pane_id && !pane.is_plugin {
+                        let current_tab =
+                            self.tabs.iter().find(|t| t.active).map(|t| t.position);
+                        if current_tab != Some(tab_idx) {
+                            switch_tab_to(tab_idx as u32);
+                        }
+                        focus_terminal_pane(pane_id, false, false);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn confirm_selection(&mut self) {
+        if let Some(entry) = self.filtered_entries.get(self.selected_index) {
+            let pane_id = entry.pane_id;
+            let tab_idx = entry.tab_index;
+
+            self.focus_highlights
+                .insert(pane_id, self.uptime_s + self.config.focus_highlight_s);
+            set_pane_color(
+                PaneId::Terminal(pane_id),
+                None,
+                Some("#1a2535".into()),
+            );
+
+            self.hide_palette();
+
+            let current_tab = self
+                .tabs
+                .iter()
+                .find(|t| t.active)
+                .map(|t| t.position);
+            if current_tab != Some(tab_idx) {
+                switch_tab_to(tab_idx as u32);
+            }
+            focus_terminal_pane(pane_id, false, false);
+        }
     }
 
     fn handle_key(&mut self, key: KeyWithModifier) -> bool {
@@ -414,32 +460,7 @@ impl State {
         }
 
         if Config::key_matches(&key, &self.config.key_confirm) {
-            if let Some(entry) = self.filtered_entries.get(self.selected_index) {
-                let pane_id = entry.pane_id;
-                let tab_idx = entry.tab_index;
-
-                // Apply highlight immediately (once), timer handles cleanup
-                self.focus_highlights.insert(pane_id, self.uptime_s + 0.5);
-                set_pane_color(
-                    PaneId::Terminal(pane_id),
-                    None,
-                    Some("#1a2535".into()),
-                );
-
-                self.hide_palette();
-
-                let current_tab = self
-                    .tabs
-                    .iter()
-                    .find(|t| t.active)
-                    .map(|t| t.position);
-
-                if current_tab != Some(tab_idx) {
-                    switch_tab_to(tab_idx as u32);
-                }
-
-                focus_terminal_pane(pane_id, false, false);
-            }
+            self.confirm_selection();
             return true;
         }
 
@@ -458,10 +479,45 @@ impl State {
         }
 
         if let BareKey::Char(ch) = key.bare_key {
-            if key.has_no_modifiers() && ch != ' ' {
-                self.search_query.push(ch);
-                self.refresh_filtered();
-                return true;
+            if key.has_no_modifiers() {
+                // h/l fold/unfold (only in grouped view, not during search)
+                if self.search_query.is_empty() && (ch == 'h' || ch == 'l') {
+                    if let Some(entry) = self.filtered_entries.get(self.selected_index)
+                    {
+                        let tab = entry.tab_index;
+                        if ch == 'h' {
+                            self.collapsed_tabs.insert(tab);
+                        } else {
+                            self.collapsed_tabs.remove(&tab);
+                        }
+                        self.refresh_filtered();
+                    }
+                    return true;
+                }
+
+                // Number selection: 1-9 jump to Nth visible entry and confirm
+                if ch >= '1' && ch <= '9' {
+                    let target = (ch as usize) - ('1' as usize);
+                    // Build visible indices (skip collapsed)
+                    let visible: Vec<usize> = self
+                        .filtered_entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| !self.collapsed_tabs.contains(&e.tab_index))
+                        .map(|(i, _)| i)
+                        .collect();
+                    if let Some(&idx) = visible.get(target) {
+                        self.selected_index = idx;
+                        self.confirm_selection();
+                    }
+                    return true;
+                }
+
+                if ch != ' ' {
+                    self.search_query.push(ch);
+                    self.refresh_filtered();
+                    return true;
+                }
             }
         }
 
@@ -495,58 +551,3 @@ impl State {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Fuzzy filter (pure logic, no WASM deps)
-// ---------------------------------------------------------------------------
-
-pub fn fuzzy_filter(query: &str, entries: Vec<state::PaneEntry>) -> Vec<state::PaneEntry> {
-    use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
-    use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32Str};
-
-    let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
-    let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
-
-    let mut scored: Vec<(u32, state::PaneEntry)> = entries
-        .into_iter()
-        .filter_map(|entry| {
-            let haystack_str = format!(
-                "{} {} {} {}",
-                entry.tab_name,
-                entry.title,
-                entry
-                    .session
-                    .as_ref()
-                    .and_then(|s| s.project_name.as_deref())
-                    .unwrap_or(""),
-                entry.pane_id,
-            );
-
-            let mut buf = Vec::new();
-            let haystack = Utf32Str::new(&haystack_str, &mut buf);
-            pattern
-                .score(haystack, &mut matcher)
-                .map(|score| (score, entry))
-        })
-        .collect();
-
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-    scored.into_iter().map(|(_, e)| e).collect()
-}
-
-impl State {
-    pub fn refresh_filtered(&mut self) {
-        let entries = self.build_entries();
-
-        if self.search_query.is_empty() {
-            self.filtered_entries = entries;
-        } else {
-            self.filtered_entries = fuzzy_filter(&self.search_query, entries);
-        }
-
-        if !self.filtered_entries.is_empty() {
-            self.selected_index = self.selected_index.min(self.filtered_entries.len() - 1);
-        } else {
-            self.selected_index = 0;
-        }
-    }
-}

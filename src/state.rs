@@ -75,6 +75,10 @@ impl Activity {
         matches!(self, Self::PermissionNeeded | Self::Notification)
     }
 
+    pub fn is_running(self) -> bool {
+        !matches!(self, Self::Idle | Self::Done)
+    }
+
     pub fn priority(self) -> u8 {
         match self {
             Self::Idle => 0,
@@ -193,6 +197,9 @@ pub struct Config {
     pub show_non_claude: bool,
     pub show_pane_id: bool,
 
+    // Focus highlight
+    pub focus_highlight_s: f64,
+
     // zjstatus
     pub zjstatus_pipe: bool,
     pub zjstatus_url: String,
@@ -214,6 +221,7 @@ impl Default for Config {
             show_elapsed_time: true,
             show_non_claude: true,
             show_pane_id: true,
+            focus_highlight_s: 0.5,
             zjstatus_pipe: true,
             zjstatus_url: "file:~/.config/zellij/plugins/zjstatus.wasm".into(),
         }
@@ -267,6 +275,9 @@ impl Config {
         if let Some(v) = map.get("show_pane_id") {
             cfg.show_pane_id = v != "false";
         }
+        if let Some(v) = map.get("focus_highlight_s") {
+            cfg.focus_highlight_s = v.parse().unwrap_or(cfg.focus_highlight_s);
+        }
         if let Some(v) = map.get("zjstatus_pipe") {
             cfg.zjstatus_pipe = v != "false";
         }
@@ -309,6 +320,8 @@ pub struct PaneEntry {
     /// Claude session info if this pane has one
     pub session: Option<SessionInfo>,
     pub is_starred: bool,
+    /// Foreground process command (from get_pane_running_command or terminal_command)
+    pub running_command: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +340,7 @@ pub struct State {
     pub search_query: String,
     pub selected_index: usize,
     pub filtered_entries: Vec<PaneEntry>,
+    pub collapsed_tabs: std::collections::HashSet<usize>,
 
     // Focus tracking
     pub current_focus_pane: Option<u32>,
@@ -337,7 +351,6 @@ pub struct State {
 
     // Plugin identity
     pub own_pane_id: Option<u32>,
-    pub zjstatus_plugin_id: Option<u32>,
 
     // Timer state
     pub uptime_s: f64,
@@ -346,6 +359,9 @@ pub struct State {
 
     // zjstatus debounce
     pub last_zjstatus_update: f64,
+
+    // Cached running commands (pane_id → basename), refreshed on palette open
+    pub running_command_cache: HashMap<u32, String>,
 
 }
 
@@ -362,6 +378,7 @@ impl Default for State {
             search_query: String::new(),
             selected_index: 0,
             filtered_entries: Vec::new(),
+            collapsed_tabs: std::collections::HashSet::new(),
 
             current_focus_pane: None,
             previous_focus_pane: None,
@@ -369,7 +386,6 @@ impl Default for State {
             focus_highlights: BTreeMap::new(),
 
             own_pane_id: None,
-            zjstatus_plugin_id: None,
 
 
             uptime_s: 0.0,
@@ -377,6 +393,8 @@ impl Default for State {
             permissions_granted: false,
 
             last_zjstatus_update: 0.0,
+
+            running_command_cache: HashMap::new(),
         }
     }
 }
@@ -392,6 +410,10 @@ impl State {
                 .map(|t| t.name.clone());
 
             for pane in panes {
+                // Skip plugin panes — their IDs can collide with terminal IDs
+                if pane.is_plugin {
+                    continue;
+                }
                 if let Some(session) = self.sessions.get_mut(&pane.id) {
                     session.tab_index = Some(tab_idx);
                     session.tab_name = tab_name.clone();
@@ -449,6 +471,7 @@ impl State {
                     is_focused: pane.is_focused,
                     session: self.sessions.get(&pane.id).cloned(),
                     is_starred: self.stars.contains(pane.id),
+                    running_command: pane.terminal_command.clone(),
                 });
             }
         }
@@ -468,6 +491,27 @@ impl State {
 // ---------------------------------------------------------------------------
 // Free functions (testable without WASM host)
 // ---------------------------------------------------------------------------
+
+/// Format sessions for zjstatus pipe_status markup.
+pub fn format_zjstatus(sessions: &BTreeMap<u32, SessionInfo>) -> String {
+    if sessions.is_empty() {
+        return String::new();
+    }
+    sessions
+        .values()
+        .map(|s| {
+            let fallback = format!("pane {}", s.pane_id);
+            let label = s.project_name.as_deref().unwrap_or(&fallback);
+            format!(
+                "#[fg={}]{} {}",
+                s.activity.color(),
+                s.activity.symbol(),
+                label
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+}
 
 /// Format elapsed time as human-readable string.
 pub fn format_elapsed(seconds: f64) -> String {

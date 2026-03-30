@@ -281,3 +281,26 @@ fn test_star_empty_cycle() {
     assert!(stars.next().is_none());
     assert!(stars.prev().is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Activity::is_running
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_is_running_active() {
+    assert!(Activity::Thinking.is_running());
+    assert!(Activity::Reading.is_running());
+    assert!(Activity::Writing.is_running());
+    assert!(Activity::BashExec.is_running());
+    assert!(Activity::WebSearch.is_running());
+    assert!(Activity::Agent.is_running());
+    assert!(Activity::Mcp.is_running());
+    assert!(Activity::PermissionNeeded.is_running());
+    assert!(Activity::Notification.is_running());
+}
+
+#[test]
+fn test_is_running_inactive() {
+    assert!(!Activity::Done.is_running());
+    assert!(!Activity::Idle.is_running());
+}

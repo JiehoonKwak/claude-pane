@@ -43,11 +43,21 @@ Detects the user's environment and installs claude-pane step-by-step.
   }
   ```
 - Add to `load_plugins`: `"claude-pane"`
-- Add keybind in locked mode:
+- Add keybinds in locked mode:
   ```kdl
   bind "Alt o" {
       MessagePlugin "claude-pane" {
           name "show"
+      }
+  }
+  bind "Alt u" {
+      MessagePlugin "claude-pane" {
+          name "star-prev"
+      }
+  }
+  bind "Alt i" {
+      MessagePlugin "claude-pane" {
+          name "star-next"
       }
   }
   ```
@@ -66,7 +76,14 @@ Detects the user's environment and installs claude-pane step-by-step.
 - Show before/after diffs for config file changes
 - Offer to revert if anything fails
 
+### 8. Remote Setup (if SSH detected)
+- Check `$SSH_CONNECTION` to detect remote context
+- Same steps apply — plugin, hooks, and config all live on the remote host
+- If `~/.claude/settings.json` is shared across machines, hook registrations are already present
+- Just ensure `claude-pane-hook.sh` exists at the expected path on the remote host
+
 ## Important
 - This skill is idempotent: running it again detects existing installation
 - Never duplicate hook bridges (check for existing send_event.py integration)
 - Always verify zellij version compatibility first
+- Works on remote machines over SSH — the WASM plugin is host-agnostic
