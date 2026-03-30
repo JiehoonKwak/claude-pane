@@ -2,6 +2,8 @@
 
 A [Zellij](https://zellij.dev) WASM plugin that manages multiple [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions across tabs and panes.
 
+![claude-pane command palette](assets/screenshot.png)
+
 ## Features
 
 - **zjstatus integration** — activity symbols in your status bar (⚡ ✎ ◎ ✓ ⚠), notification-only tab indicators
@@ -68,14 +70,14 @@ keybinds {
 }
 ```
 
-5. Register the hook bridge (skip if you already have `send_event.py` with zellij pipe):
+5. Register the hook bridge:
 
 ```bash
 cp scripts/claude-pane-hook.sh ~/.config/zellij/plugins/
 chmod +x ~/.config/zellij/plugins/claude-pane-hook.sh
 ```
 
-Add to your Claude Code `settings.json`:
+Add to `~/.claude/settings.json`:
 
 ```json
 {
@@ -95,38 +97,6 @@ Add to your Claude Code `settings.json`:
 format_right "{pipe_status} {session}"
 pipe_status_rendermode "dynamic"
 ```
-
-## Remote Setup
-
-The plugin runs inside Zellij's WASM runtime and is host-agnostic — it works wherever Zellij runs, including remote SSH sessions.
-
-### Shared `~/.claude/settings.json`
-
-If you sync `~/.claude/settings.json` across machines (dotfiles, NFS, etc.), hook registrations are already present on remote hosts. You only need to set up the WASM plugin and Zellij config.
-
-### Steps
-
-```bash
-# 1. SSH to remote host
-ssh <server>
-
-# 2. Install Zellij (if not present)
-cargo install zellij   # or use package manager
-
-# 3. Copy WASM plugin
-scp ~/.config/zellij/plugins/claude-pane.wasm <server>:~/.config/zellij/plugins/
-
-# 4. Copy hook bridge script
-scp ~/.config/zellij/plugins/claude-pane-hook.sh <server>:~/.config/zellij/plugins/
-ssh <server> chmod +x ~/.config/zellij/plugins/claude-pane-hook.sh
-
-# 5. Copy or create config.kdl on remote (same plugin block + keybinds)
-
-# 6. Start Zellij on remote
-ssh <server> -t zellij
-```
-
-Everything works identically: palette, flash notifications, zjstatus, star cycling, process detection.
 
 ## Command Palette
 
@@ -169,8 +139,6 @@ Everything works identically: palette, flash notifications, zjstatus, star cycli
 
 ## Configuration
 
-All keys are optional. Defaults shown below.
-
 ```kdl
 claude-pane location="file:~/.config/zellij/plugins/claude-pane.wasm" {
     // Palette keybindings
@@ -200,25 +168,12 @@ claude-pane location="file:~/.config/zellij/plugins/claude-pane.wasm" {
 ## Build from Source
 
 ```bash
-# Requires Rust with wasm32-wasip1 target
 rustup target add wasm32-wasip1
 cargo build --release
-# Output: target/wasm32-wasip1/release/claude-pane.wasm (~1.2MB)
+# → target/wasm32-wasip1/release/claude-pane.wasm
 ```
 
-## How It Works
-
-1. Plugin loads in the background via `load_plugins`
-2. Claude Code hooks fire on tool use, sending JSON payloads via `zellij pipe`
-3. Plugin receives events, tracks activity per pane, pipes status to zjstatus
-4. Tab names only change when attention needed (⚠ prefix)
-5. Press `Alt+o` to open the floating palette — shows all panes with activity, process names, and stars
-6. `Alt+u`/`Alt+i` cycle through starred panes without opening the palette
-7. Non-Claude panes show their running process (nvim, lazygit, etc.)
-
 ## References
-
-This is a personal project. Inspired by and builds on ideas from:
 
 **Zellij + Claude Code**
 - [claude-code-zellij-status](https://github.com/thoo/claude-code-zellij-status) — Monitor Claude Code activity via zjstatus
