@@ -376,7 +376,7 @@ mod plugin {
                     switch_tab_to(tab_idx as u32);
                 }
 
-                focus_terminal_pane(pane_id, false);
+                focus_terminal_pane(pane_id, false, false);
             }
             return true;
         }
