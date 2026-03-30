@@ -6,97 +6,103 @@ mod tests;
 
 use state::{Activity, Config, HookPayload, NotificationFlash, State};
 
+#[cfg(target_arch = "wasm32")]
+use zellij_tile::prelude::*;
+
+// register_plugin! generates main() — must be at crate root
+#[cfg(target_arch = "wasm32")]
+register_plugin!(State);
+
+// Dummy main for host-target compilation (tests, clippy)
+#[cfg(not(target_arch = "wasm32"))]
+fn main() {}
+
 // ---------------------------------------------------------------------------
-// WASM-only: plugin registration + ZellijPlugin trait + host function calls
+// ZellijPlugin trait (WASM only)
 // ---------------------------------------------------------------------------
 
 #[cfg(target_arch = "wasm32")]
-mod plugin {
-    use super::*;
-    use std::collections::BTreeMap;
-    use zellij_tile::prelude::*;
+impl ZellijPlugin for State {
+    fn load(&mut self, configuration: std::collections::BTreeMap<String, String>) {
+        self.config = Config::from_map(&configuration);
+        request_permission(&[
+            PermissionType::ReadApplicationState,
+            PermissionType::ChangeApplicationState,
+            PermissionType::MessageAndLaunchOtherPlugins,
+            PermissionType::RunCommands,
+        ]);
+        subscribe(&[
+            EventType::PaneUpdate,
+            EventType::TabUpdate,
+            EventType::Timer,
+            EventType::Key,
+            EventType::Mouse,
+            EventType::RunCommandResult,
+            EventType::PermissionRequestResult,
+        ]);
+        set_timeout(1.0);
+        eprintln!("claude-pane: loaded (v{})", env!("CARGO_PKG_VERSION"));
+    }
 
-    register_plugin!(State);
-
-    impl ZellijPlugin for State {
-        fn load(&mut self, configuration: BTreeMap<String, String>) {
-            self.config = Config::from_map(&configuration);
-            request_permission(&[
-                PermissionType::ReadApplicationState,
-                PermissionType::ChangeApplicationState,
-                PermissionType::MessageAndLaunchOtherPlugins,
-                PermissionType::RunCommands,
-            ]);
-            subscribe(&[
-                EventType::PaneUpdate,
-                EventType::TabUpdate,
-                EventType::Timer,
-                EventType::Key,
-                EventType::Mouse,
-                EventType::RunCommandResult,
-                EventType::PermissionRequestResult,
-            ]);
-            set_timeout(1.0);
-            eprintln!("claude-pane: loaded (v{})", env!("CARGO_PKG_VERSION"));
-        }
-
-        fn update(&mut self, event: Event) -> bool {
-            match event {
-                Event::PaneUpdate(manifest) => {
-                    self.pane_manifest = manifest.panes;
-                    self.track_focus();
-                    self.rebuild_pane_map();
-                    self.prune_dead_sessions();
-                    if self.visible {
-                        self.refresh_filtered();
-                    }
-                    self.visible
+    fn update(&mut self, event: Event) -> bool {
+        match event {
+            Event::PaneUpdate(manifest) => {
+                self.pane_manifest = manifest.panes;
+                self.track_focus();
+                self.rebuild_pane_map();
+                self.prune_dead_sessions();
+                if self.visible {
+                    self.refresh_filtered();
                 }
-                Event::TabUpdate(tabs) => {
-                    self.tabs = tabs;
-                    self.rebuild_pane_map();
-                    if self.visible {
-                        self.refresh_filtered();
-                    }
-                    self.visible
-                }
-                Event::Timer(elapsed) => {
-                    self.uptime_s += elapsed;
-                    self.tick_count += 1;
-                    handle_timer(self)
-                }
-                Event::Key(key) if self.visible => handle_key(self, key),
-                Event::Mouse(mouse) if self.visible => handle_mouse(self, mouse),
-                Event::PermissionRequestResult(status) => {
-                    if status == PermissionStatus::Granted {
-                        self.permissions_granted = true;
-                        eprintln!("claude-pane: permissions granted");
-                    }
-                    false
-                }
-                _ => false,
+                self.visible
             }
-        }
-
-        fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
-            handle_pipe(self, pipe_message)
-        }
-
-        fn render(&mut self, rows: usize, cols: usize) {
-            render::render(self, rows, cols);
+            Event::TabUpdate(tabs) => {
+                self.tabs = tabs;
+                self.rebuild_pane_map();
+                if self.visible {
+                    self.refresh_filtered();
+                }
+                self.visible
+            }
+            Event::Timer(elapsed) => {
+                self.uptime_s += elapsed;
+                self.tick_count += 1;
+                self.handle_timer()
+            }
+            Event::Key(key) if self.visible => self.handle_key(key),
+            Event::Mouse(mouse) if self.visible => self.handle_mouse(mouse),
+            Event::PermissionRequestResult(status) => {
+                if status == PermissionStatus::Granted {
+                    self.permissions_granted = true;
+                    eprintln!("claude-pane: permissions granted");
+                }
+                false
+            }
+            _ => false,
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Pipe handler
-    // -----------------------------------------------------------------------
+    fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
+        self.handle_pipe(pipe_message)
+    }
 
-    fn handle_pipe(state: &mut State, msg: PipeMessage) -> bool {
+    fn render(&mut self, rows: usize, cols: usize) {
+        render::render(self, rows, cols);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Methods that call WASM host functions (gated)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "wasm32")]
+impl State {
+    fn handle_pipe(&mut self, msg: PipeMessage) -> bool {
         match msg.name.as_str() {
             "claude-pane:event" | "event" => {
                 if let Some(payload) = &msg.payload {
                     match serde_json::from_str::<HookPayload>(payload) {
-                        Ok(hook) => handle_hook_event(state, hook),
+                        Ok(hook) => self.handle_hook_event(hook),
                         Err(e) => {
                             eprintln!("claude-pane: malformed payload: {e}");
                             false
@@ -107,19 +113,19 @@ mod plugin {
                 }
             }
             "show" | "claude-pane:show" => {
-                show_palette(state);
+                self.show_palette();
                 true
             }
             "hide" | "claude-pane:hide" => {
-                hide_palette(state);
+                self.hide_palette();
                 true
             }
             "dump-state" | "claude-pane:dump-state" => {
                 eprintln!(
                     "claude-pane: sessions={:?}",
-                    state.sessions.keys().collect::<Vec<_>>()
+                    self.sessions.keys().collect::<Vec<_>>()
                 );
-                for (id, s) in &state.sessions {
+                for (id, s) in &self.sessions {
                     eprintln!(
                         "  pane={} activity={:?} project={:?} tab={:?}",
                         id, s.activity, s.project_name, s.tab_name
@@ -135,12 +141,12 @@ mod plugin {
         }
     }
 
-    fn handle_hook_event(state: &mut State, hook: HookPayload) -> bool {
+    fn handle_hook_event(&mut self, hook: HookPayload) -> bool {
         let activity =
             Activity::from_hook_event(&hook.hook_event, hook.tool_name.as_deref());
-        let now = state.uptime_s;
+        let now = self.uptime_s;
 
-        let session = state
+        let session = self
             .sessions
             .entry(hook.pane_id)
             .or_insert_with(|| state::SessionInfo::new(hook.pane_id, activity, now));
@@ -160,11 +166,11 @@ mod plugin {
 
         // Flash on permission/notification
         if activity.is_attention()
-            && state.config.notification_flash != NotificationFlash::Off
+            && self.config.notification_flash != NotificationFlash::Off
         {
-            let duration_s = if state.config.notification_flash == NotificationFlash::Brief
+            let duration_s = if self.config.notification_flash == NotificationFlash::Brief
             {
-                state.config.flash_duration_ms as f64 / 1000.0
+                self.config.flash_duration_ms as f64 / 1000.0
             } else {
                 f64::MAX
             };
@@ -173,7 +179,7 @@ mod plugin {
 
         // Clear flash on UserPromptSubmit
         if hook.hook_event == "UserPromptSubmit" {
-            if let Some(s) = state.sessions.get_mut(&hook.pane_id) {
+            if let Some(s) = self.sessions.get_mut(&hook.pane_id) {
                 s.flash_deadline = 0.0;
                 highlight_and_unhighlight_panes(
                     vec![],
@@ -182,33 +188,29 @@ mod plugin {
             }
         }
 
-        state.rebuild_pane_map();
+        self.rebuild_pane_map();
 
         if activity != prev_activity {
-            update_zjstatus(state);
+            self.update_zjstatus();
         }
 
-        state.visible
+        self.visible
     }
 
-    // -----------------------------------------------------------------------
-    // Timer / animation
-    // -----------------------------------------------------------------------
-
-    fn handle_timer(state: &mut State) -> bool {
-        let now = state.uptime_s;
+    fn handle_timer(&mut self) -> bool {
+        let now = self.uptime_s;
         let mut any_flash_active = false;
         let mut need_zjstatus_update = false;
         let mut to_remove: Vec<u32> = Vec::new();
 
-        let done_timeout = state.config.done_timeout_s;
-        let idle_remove = state.config.idle_remove_s;
-        let tick_even = state.tick_count.is_multiple_of(2);
+        let done_timeout = self.config.done_timeout_s;
+        let idle_remove = self.config.idle_remove_s;
+        let tick_even = self.tick_count.is_multiple_of(2);
 
-        let ids: Vec<u32> = state.sessions.keys().copied().collect();
+        let ids: Vec<u32> = self.sessions.keys().copied().collect();
 
         for pane_id in ids {
-            let session = match state.sessions.get_mut(&pane_id) {
+            let session = match self.sessions.get_mut(&pane_id) {
                 Some(s) => s,
                 None => continue,
             };
@@ -249,124 +251,106 @@ mod plugin {
         }
 
         for id in to_remove {
-            state.sessions.remove(&id);
+            self.sessions.remove(&id);
         }
 
         if need_zjstatus_update {
-            update_zjstatus(state);
+            self.update_zjstatus();
         }
 
         let interval = if any_flash_active { 0.5 } else { 1.0 };
         set_timeout(interval);
 
-        state.visible
+        self.visible
     }
 
-    // -----------------------------------------------------------------------
-    // zjstatus integration
-    // -----------------------------------------------------------------------
-
-    fn update_zjstatus(state: &mut State) {
-        if !state.config.zjstatus_pipe {
+    fn update_zjstatus(&mut self) {
+        if !self.config.zjstatus_pipe {
             return;
         }
 
-        let now = state.uptime_s;
-        if (now - state.last_zjstatus_update) < 0.25 {
+        let now = self.uptime_s;
+        if (now - self.last_zjstatus_update) < 0.25 {
             return;
         }
-        state.last_zjstatus_update = now;
+        self.last_zjstatus_update = now;
 
-        let formatted = state.format_zjstatus();
+        let formatted = self.format_zjstatus();
         let pipe_payload = format!("zjstatus::pipe::pipe_status::{}", formatted);
 
         pipe_message_to_plugin(
             MessageToPlugin::new("pipe_status")
-                .with_plugin_url(&state.config.zjstatus_url)
+                .with_plugin_url(&self.config.zjstatus_url)
                 .with_payload(pipe_payload),
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Focus tracking
-    // -----------------------------------------------------------------------
-
-    impl State {
-        fn track_focus(&mut self) {
-            for panes in self.pane_manifest.values() {
-                for pane in panes {
-                    if pane.is_focused && !pane.is_plugin {
-                        let new_focus = pane.id;
-                        if self.current_focus_pane != Some(new_focus) {
-                            self.previous_focus_pane = self.current_focus_pane;
-                            self.current_focus_pane = Some(new_focus);
-                        }
-                        return;
+    fn track_focus(&mut self) {
+        for panes in self.pane_manifest.values() {
+            for pane in panes {
+                if pane.is_focused && !pane.is_plugin {
+                    let new_focus = pane.id;
+                    if self.current_focus_pane != Some(new_focus) {
+                        self.previous_focus_pane = self.current_focus_pane;
+                        self.current_focus_pane = Some(new_focus);
                     }
+                    return;
                 }
             }
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Palette show/hide
-    // -----------------------------------------------------------------------
-
-    fn show_palette(state: &mut State) {
-        state.visible = true;
-        state.search_query.clear();
-        state.selected_index = 0;
-        state.refresh_filtered();
+    fn show_palette(&mut self) {
+        self.visible = true;
+        self.search_query.clear();
+        self.selected_index = 0;
+        self.refresh_filtered();
         show_self(true);
     }
 
-    fn hide_palette(state: &mut State) {
-        state.visible = false;
-        state.search_query.clear();
+    fn hide_palette(&mut self) {
+        self.visible = false;
+        self.search_query.clear();
         hide_self();
     }
 
-    // -----------------------------------------------------------------------
-    // Key handling (palette mode)
-    // -----------------------------------------------------------------------
-
-    fn handle_key(state: &mut State, key: KeyWithModifier) -> bool {
-        if Config::key_matches(&key, &state.config.key_cancel) {
-            hide_palette(state);
+    fn handle_key(&mut self, key: KeyWithModifier) -> bool {
+        if Config::key_matches(&key, &self.config.key_cancel) {
+            self.hide_palette();
             return true;
         }
 
-        if Config::key_matches(&key, &state.config.key_select_down) {
-            if !state.filtered_entries.is_empty() {
-                state.selected_index =
-                    (state.selected_index + 1) % state.filtered_entries.len();
+        if Config::key_matches(&key, &self.config.key_select_down) {
+            if !self.filtered_entries.is_empty() {
+                self.selected_index =
+                    (self.selected_index + 1) % self.filtered_entries.len();
             }
             return true;
         }
 
-        if Config::key_matches(&key, &state.config.key_select_up) {
-            if !state.filtered_entries.is_empty() {
-                if state.selected_index == 0 {
-                    state.selected_index = state.filtered_entries.len() - 1;
+        if Config::key_matches(&key, &self.config.key_select_up) {
+            if !self.filtered_entries.is_empty() {
+                if self.selected_index == 0 {
+                    self.selected_index = self.filtered_entries.len() - 1;
                 } else {
-                    state.selected_index -= 1;
+                    self.selected_index -= 1;
                 }
             }
             return true;
         }
 
-        if Config::key_matches(&key, &state.config.key_confirm) {
-            if let Some(entry) = state.filtered_entries.get(state.selected_index) {
+        if Config::key_matches(&key, &self.config.key_confirm) {
+            if let Some(entry) = self.filtered_entries.get(self.selected_index) {
                 let pane_id = entry.pane_id;
                 let tab_idx = entry.tab_index;
 
-                if let Some(session) = state.sessions.get_mut(&pane_id) {
-                    session.focus_highlight_deadline = state.uptime_s + 2.0;
+                if let Some(session) = self.sessions.get_mut(&pane_id) {
+                    session.focus_highlight_deadline = self.uptime_s + 2.0;
                 }
 
-                hide_palette(state);
+                self.hide_palette();
 
-                let current_tab = state
+                let current_tab = self
                     .tabs
                     .iter()
                     .find(|t| t.active)
@@ -381,24 +365,24 @@ mod plugin {
             return true;
         }
 
-        if Config::key_matches(&key, &state.config.key_toggle_star) {
-            if let Some(entry) = state.filtered_entries.get(state.selected_index) {
-                state.stars.toggle(entry.pane_id);
-                state.refresh_filtered();
+        if Config::key_matches(&key, &self.config.key_toggle_star) {
+            if let Some(entry) = self.filtered_entries.get(self.selected_index) {
+                self.stars.toggle(entry.pane_id);
+                self.refresh_filtered();
             }
             return true;
         }
 
-        if Config::key_matches(&key, &state.config.key_delete_char) {
-            state.search_query.pop();
-            state.refresh_filtered();
+        if Config::key_matches(&key, &self.config.key_delete_char) {
+            self.search_query.pop();
+            self.refresh_filtered();
             return true;
         }
 
         if let BareKey::Char(ch) = key.bare_key {
             if key.has_no_modifiers() && ch != ' ' {
-                state.search_query.push(ch);
-                state.refresh_filtered();
+                self.search_query.push(ch);
+                self.refresh_filtered();
                 return true;
             }
         }
@@ -406,25 +390,25 @@ mod plugin {
         false
     }
 
-    fn handle_mouse(state: &mut State, mouse: Mouse) -> bool {
+    fn handle_mouse(&mut self, mouse: Mouse) -> bool {
         match mouse {
             Mouse::ScrollUp(_) => {
-                if state.selected_index > 0 {
-                    state.selected_index -= 1;
+                if self.selected_index > 0 {
+                    self.selected_index -= 1;
                 }
                 true
             }
             Mouse::ScrollDown(_) => {
-                if !state.filtered_entries.is_empty() {
-                    state.selected_index =
-                        (state.selected_index + 1).min(state.filtered_entries.len() - 1);
+                if !self.filtered_entries.is_empty() {
+                    self.selected_index =
+                        (self.selected_index + 1).min(self.filtered_entries.len() - 1);
                 }
                 true
             }
             Mouse::LeftClick(line, _col) => {
                 let idx = line.saturating_sub(3);
-                if (idx as usize) < state.filtered_entries.len() {
-                    state.selected_index = idx as usize;
+                if (idx as usize) < self.filtered_entries.len() {
+                    self.selected_index = idx as usize;
                 }
                 true
             }
@@ -471,7 +455,6 @@ pub fn fuzzy_filter(query: &str, entries: Vec<state::PaneEntry>) -> Vec<state::P
     scored.into_iter().map(|(_, e)| e).collect()
 }
 
-// refresh_filtered needs to be accessible from both plugin module and state
 impl State {
     pub fn refresh_filtered(&mut self) {
         let entries = self.build_entries();

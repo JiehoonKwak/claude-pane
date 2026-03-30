@@ -5,11 +5,6 @@ edition = "2021"
 authors = ["jiehoonk"]
 description = "Zellij plugin for Claude Code session management"
 license = "MIT"
-autobins = false
-
-[lib]
-crate-type = ["cdylib"]
-path = "src/main.rs"
 
 [dependencies]
 zellij-tile = "0.44"
