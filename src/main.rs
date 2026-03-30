@@ -87,6 +87,13 @@ impl ZellijPlugin for State {
     }
 
     fn render(&mut self, rows: usize, cols: usize) {
+        // render() is only called when plugin pane is visible
+        if !self.visible {
+            self.visible = true;
+            self.search_query.clear();
+            self.selected_index = 0;
+            self.refresh_filtered();
+        }
         render::render(self, rows, cols);
     }
 }
@@ -276,13 +283,11 @@ impl State {
         self.last_zjstatus_update = now;
 
         let formatted = self.format_zjstatus();
-        let pipe_payload = format!("zjstatus::pipe::pipe_status::{}", formatted);
+        let pipe_name = format!("zjstatus::pipe::pipe_status::{}", formatted);
 
-        pipe_message_to_plugin(
-            MessageToPlugin::new("pipe_status")
-                .with_plugin_url(&self.config.zjstatus_url)
-                .with_payload(pipe_payload),
-        );
+        // Broadcast without URL — targets existing zjstatus instance
+        // Using with_plugin_url() would create a new zjstatus without config
+        pipe_message_to_plugin(MessageToPlugin::new(&pipe_name));
     }
 
     fn track_focus(&mut self) {
