@@ -74,6 +74,39 @@ impl Activity {
     pub fn is_attention(self) -> bool {
         matches!(self, Self::PermissionNeeded | Self::Notification)
     }
+
+    pub fn priority(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::Done => 1,
+            Self::Thinking => 2,
+            Self::Reading => 3,
+            Self::Writing => 4,
+            Self::BashExec => 5,
+            Self::WebSearch => 5,
+            Self::Agent | Self::Mcp => 5,
+            Self::Notification => 8,
+            Self::PermissionNeeded => 9,
+        }
+    }
+}
+
+/// Strip leading activity symbols from a tab name to recover the base name.
+pub fn strip_activity_prefix(name: &str) -> &str {
+    const SYMBOLS: &[char] = &['◐', '◎', '✎', '⚡', '◍', '▶', '✓', '⚠', '?', '○'];
+    let mut s = name;
+    loop {
+        let trimmed = s.trim_start();
+        if trimmed.is_empty() {
+            return s;
+        }
+        let first = trimmed.chars().next().unwrap();
+        if SYMBOLS.contains(&first) {
+            s = &trimmed[first.len_utf8()..];
+        } else {
+            return trimmed;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +124,7 @@ pub struct SessionInfo {
     pub tool_name: Option<String>,
     // Deadline-based animation state (absolute uptime_s values)
     pub flash_deadline: f64,
+    /// Steady tint after blink ends (persist mode). Cleared on UserPromptSubmit.
     pub focus_highlight_deadline: f64,
 }
 
@@ -298,6 +332,13 @@ pub struct State {
     pub current_focus_pane: Option<u32>,
     pub previous_focus_pane: Option<u32>,
 
+    // Focus highlight (pane_id → expiry deadline, applied once)
+    pub focus_highlights: BTreeMap<u32, f64>,
+
+    // Plugin identity
+    pub own_pane_id: Option<u32>,
+    pub zjstatus_plugin_id: Option<u32>,
+
     // Timer state
     pub uptime_s: f64,
     pub tick_count: u64,
@@ -305,6 +346,7 @@ pub struct State {
 
     // zjstatus debounce
     pub last_zjstatus_update: f64,
+
 }
 
 impl Default for State {
@@ -323,6 +365,12 @@ impl Default for State {
 
             current_focus_pane: None,
             previous_focus_pane: None,
+
+            focus_highlights: BTreeMap::new(),
+
+            own_pane_id: None,
+            zjstatus_plugin_id: None,
+
 
             uptime_s: 0.0,
             tick_count: 0,
@@ -367,6 +415,7 @@ impl State {
     /// Build the list of pane entries for the palette.
     pub fn build_entries(&self) -> Vec<PaneEntry> {
         let mut entries = Vec::new();
+        let mut seen = std::collections::HashSet::new();
 
         for (&tab_idx, panes) in &self.pane_manifest {
             let tab_name = self
@@ -377,11 +426,15 @@ impl State {
                 .unwrap_or_else(|| format!("Tab {}", tab_idx));
 
             for pane in panes {
-                if pane.is_plugin && !self.sessions.contains_key(&pane.id) {
-                    continue; // skip non-Claude plugin panes
+                // Skip all plugin panes first (before dedup)
+                if pane.is_plugin {
+                    continue;
+                }
+                // Deduplicate terminal panes by pane_id
+                if !seen.insert(pane.id) {
+                    continue;
                 }
                 if !self.config.show_non_claude
-                    && !pane.is_plugin
                     && !self.sessions.contains_key(&pane.id)
                 {
                     continue;
@@ -400,47 +453,21 @@ impl State {
             }
         }
 
-        // Sort: starred first, then by tab index, then pane_id
+        // Sort: group by tab, starred first within tab, then pane_id
         entries.sort_by(|a, b| {
-            b.is_starred
-                .cmp(&a.is_starred)
-                .then(a.tab_index.cmp(&b.tab_index))
+            a.tab_index
+                .cmp(&b.tab_index)
+                .then(b.is_starred.cmp(&a.is_starred))
                 .then(a.pane_id.cmp(&b.pane_id))
         });
 
         entries
-    }
-
-    pub fn format_zjstatus(&self) -> String {
-        format_zjstatus(&self.sessions)
     }
 }
 
 // ---------------------------------------------------------------------------
 // Free functions (testable without WASM host)
 // ---------------------------------------------------------------------------
-
-/// Format the zjstatus pipe_status string.
-pub fn format_zjstatus(sessions: &BTreeMap<u32, SessionInfo>) -> String {
-    if sessions.is_empty() {
-        return String::new();
-    }
-
-    let mut parts: Vec<String> = Vec::new();
-    for session in sessions.values() {
-        let sym = session.activity.symbol();
-        let color = session.activity.color();
-        let label = session.project_name.as_deref().unwrap_or("");
-
-        if label.is_empty() {
-            parts.push(format!("#[fg={}]{}", color, sym));
-        } else {
-            parts.push(format!("#[fg={}]{} {}", color, sym, label));
-        }
-    }
-
-    parts.join("  ")
-}
 
 /// Format elapsed time as human-readable string.
 pub fn format_elapsed(seconds: f64) -> String {

@@ -4,7 +4,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-use state::{Activity, Config, HookPayload, NotificationFlash, State};
+use state::{strip_activity_prefix, Activity, Config, HookPayload, NotificationFlash, State};
 
 #[cfg(target_arch = "wasm32")]
 use zellij_tile::prelude::*;
@@ -40,6 +40,10 @@ impl ZellijPlugin for State {
             EventType::RunCommandResult,
             EventType::PermissionRequestResult,
         ]);
+        // Store our own pane_id for self-filtering
+        let ids = get_plugin_ids();
+        self.own_pane_id = Some(ids.plugin_id);
+
         set_timeout(1.0);
         eprintln!("claude-pane: loaded (v{})", env!("CARGO_PKG_VERSION"));
     }
@@ -48,6 +52,7 @@ impl ZellijPlugin for State {
         match event {
             Event::PaneUpdate(manifest) => {
                 self.pane_manifest = manifest.panes;
+                self.discover_zjstatus();
                 self.track_focus();
                 self.rebuild_pane_map();
                 self.prune_dead_sessions();
@@ -128,16 +133,25 @@ impl State {
                 true
             }
             "dump-state" | "claude-pane:dump-state" => {
-                eprintln!(
-                    "claude-pane: sessions={:?}",
-                    self.sessions.keys().collect::<Vec<_>>()
-                );
-                for (id, s) in &self.sessions {
-                    eprintln!(
-                        "  pane={} activity={:?} project={:?} tab={:?}",
-                        id, s.activity, s.project_name, s.tab_name
-                    );
+                let mut out = String::new();
+                out.push_str(&format!("own_pane_id={:?} zjstatus_id={:?}\n",
+                    self.own_pane_id, self.zjstatus_plugin_id));
+                for t in &self.tabs {
+                    out.push_str(&format!("tab: pos={} name={:?} active={}\n", t.position, t.name, t.active));
                 }
+                for (&tab_idx, panes) in &self.pane_manifest {
+                    for p in panes {
+                        out.push_str(&format!("manifest: tab_key={} pane_id={} plugin={} title={:?}\n",
+                            tab_idx, p.id, p.is_plugin, p.title));
+                    }
+                }
+                for (id, s) in &self.sessions {
+                    out.push_str(&format!("session: pane={} activity={:?} tab_idx={:?} project={:?}\n",
+                        id, s.activity, s.tab_index, s.project_name));
+                }
+                let home = std::env::var("HOME").unwrap_or_default();
+                let path = format!("{home}/.config/zellij/plugins/claude-pane-dump.txt");
+                let _ = std::fs::write(&path, &out);
                 false
             }
             "test" | "claude-pane:test" => {
@@ -172,26 +186,24 @@ impl State {
         }
 
         // Flash on permission/notification
+        // Blink for flash_duration_ms, then steady tint until UserPromptSubmit (persist)
         if activity.is_attention()
             && self.config.notification_flash != NotificationFlash::Off
         {
-            let duration_s = if self.config.notification_flash == NotificationFlash::Brief
-            {
-                self.config.flash_duration_ms as f64 / 1000.0
-            } else {
-                f64::MAX
-            };
-            session.flash_deadline = now + duration_s;
+            let blink_s = self.config.flash_duration_ms as f64 / 1000.0;
+            session.flash_deadline = now + blink_s;
+            // For persist mode, keep steady tint after blink ends
+            if self.config.notification_flash == NotificationFlash::Persist {
+                session.focus_highlight_deadline = f64::MAX;
+            }
         }
 
-        // Clear flash on UserPromptSubmit
+        // Clear all visual indicators on UserPromptSubmit
         if hook.hook_event == "UserPromptSubmit" {
             if let Some(s) = self.sessions.get_mut(&hook.pane_id) {
                 s.flash_deadline = 0.0;
-                highlight_and_unhighlight_panes(
-                    vec![],
-                    vec![PaneId::Terminal(hook.pane_id)],
-                );
+                s.focus_highlight_deadline = 0.0;
+                set_pane_color(PaneId::Terminal(hook.pane_id), None, None);
             }
         }
 
@@ -225,30 +237,34 @@ impl State {
             if session.flash_deadline > now {
                 any_flash_active = true;
                 if tick_even {
-                    highlight_and_unhighlight_panes(
-                        vec![PaneId::Terminal(pane_id)],
-                        vec![],
+                    // Flash ON: subtle background tint
+                    set_pane_color(
+                        PaneId::Terminal(pane_id),
+                        None,
+                        Some("#273548".into()),
                     );
                 } else {
-                    highlight_and_unhighlight_panes(
-                        vec![],
-                        vec![PaneId::Terminal(pane_id)],
-                    );
+                    // Flash OFF: reset background
+                    set_pane_color(PaneId::Terminal(pane_id), None, None);
                 }
             } else if session.focus_highlight_deadline > now {
-                highlight_and_unhighlight_panes(
-                    vec![PaneId::Terminal(pane_id)],
-                    vec![],
+                // Steady tint (persist mode: blink ended, hold until UserPromptSubmit)
+                set_pane_color(
+                    PaneId::Terminal(pane_id),
+                    None,
+                    Some("#1a2535".into()),
                 );
+            } else if session.focus_highlight_deadline > 0.0 {
+                // Steady tint just expired — reset
+                session.focus_highlight_deadline = 0.0;
+                set_pane_color(PaneId::Terminal(pane_id), None, None);
             } else if session.activity == Activity::Done
                 && (now - session.last_event_ts) > done_timeout
             {
                 session.activity = Activity::Idle;
                 need_zjstatus_update = true;
-                highlight_and_unhighlight_panes(
-                    vec![],
-                    vec![PaneId::Terminal(pane_id)],
-                );
+                // Reset background
+                set_pane_color(PaneId::Terminal(pane_id), None, None);
             } else if session.activity == Activity::Idle
                 && (now - session.last_event_ts) > idle_remove
             {
@@ -261,6 +277,26 @@ impl State {
             self.sessions.remove(&id);
         }
 
+        // Focus highlights: applied once on selection, only reset on expiry
+        let expired: Vec<u32> = self
+            .focus_highlights
+            .iter()
+            .filter(|(_, &deadline)| deadline <= now)
+            .map(|(&id, _)| id)
+            .collect();
+        for pane_id in expired {
+            self.focus_highlights.remove(&pane_id);
+            // Skip reset if notification flash is still active
+            let has_flash = self
+                .sessions
+                .get(&pane_id)
+                .map(|s| s.flash_deadline > now)
+                .unwrap_or(false);
+            if !has_flash {
+                set_pane_color(PaneId::Terminal(pane_id), None, None);
+            }
+        }
+
         if need_zjstatus_update {
             self.update_zjstatus();
         }
@@ -271,23 +307,56 @@ impl State {
         self.visible
     }
 
-    fn update_zjstatus(&mut self) {
-        if !self.config.zjstatus_pipe {
-            return;
+    fn discover_zjstatus(&mut self) {
+        for panes in self.pane_manifest.values() {
+            for pane in panes {
+                if pane.is_plugin {
+                    if let Some(ref url) = pane.plugin_url {
+                        if url.contains("zjstatus") {
+                            self.zjstatus_plugin_id = Some(pane.id);
+                            return;
+                        }
+                    }
+                }
+            }
         }
+    }
 
+    fn update_zjstatus(&mut self) {
         let now = self.uptime_s;
         if (now - self.last_zjstatus_update) < 0.25 {
             return;
         }
         self.last_zjstatus_update = now;
 
-        let formatted = self.format_zjstatus();
-        let pipe_name = format!("zjstatus::pipe::pipe_status::{}", formatted);
+        // Pick highest-priority activity per tab
+        let mut tab_activity: std::collections::HashMap<usize, Activity> =
+            std::collections::HashMap::new();
+        for session in self.sessions.values() {
+            if let Some(tab_idx) = session.tab_index {
+                let dominated = tab_activity
+                    .get(&tab_idx)
+                    .map(|cur| session.activity.priority() > cur.priority())
+                    .unwrap_or(true);
+                if dominated {
+                    tab_activity.insert(tab_idx, session.activity);
+                }
+            }
+        }
 
-        // Broadcast without URL — targets existing zjstatus instance
-        // Using with_plugin_url() would create a new zjstatus without config
-        pipe_message_to_plugin(MessageToPlugin::new(&pipe_name));
+        for tab in &self.tabs {
+            // Strip any existing activity symbol prefix to get base name
+            let base = strip_activity_prefix(&tab.name);
+            let new_name = if let Some(activity) = tab_activity.get(&tab.position) {
+                format!("{} {}", activity.symbol(), base)
+            } else {
+                base.to_string()
+            };
+
+            if tab.name != new_name {
+                rename_tab(tab.position as u32, &new_name);
+            }
+        }
     }
 
     fn track_focus(&mut self) {
@@ -349,9 +418,13 @@ impl State {
                 let pane_id = entry.pane_id;
                 let tab_idx = entry.tab_index;
 
-                if let Some(session) = self.sessions.get_mut(&pane_id) {
-                    session.focus_highlight_deadline = self.uptime_s + 2.0;
-                }
+                // Apply highlight immediately (once), timer handles cleanup
+                self.focus_highlights.insert(pane_id, self.uptime_s + 0.5);
+                set_pane_color(
+                    PaneId::Terminal(pane_id),
+                    None,
+                    Some("#1a2535".into()),
+                );
 
                 self.hide_palette();
 

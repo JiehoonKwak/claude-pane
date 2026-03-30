@@ -7,7 +7,7 @@ A [Zellij](https://zellij.dev) WASM plugin that manages multiple [Claude Code](h
 ## Features
 
 - **zjstatus integration** — activity symbols in your status bar (⚡ ✎ ◎ ✓ ⚠)
-- **Border highlighting** — pane borders flash purple when Claude needs attention
+- **Background flash** — pane background blinks when Claude needs attention (permission, notification)
 - **Command palette** — fuzzy-searchable pane picker across all tabs
 - **Star bookmarks** — pin important panes, cycle through them with a keybind
 - **Hook bridge** — zero-config if you use Claude Code's hook system
@@ -137,7 +137,7 @@ claude-pane location="file:~/.config/zellij/plugins/claude-pane.wasm" {
 # Requires Rust with wasm32-wasip1 target
 rustup target add wasm32-wasip1
 cargo build --release
-# Output: target/wasm32-wasip1/release/claude_pane.wasm (~960KB)
+# Output: target/wasm32-wasip1/release/claude-pane.wasm (~1.2MB)
 ```
 
 ## How It Works
@@ -150,13 +150,22 @@ cargo build --release
 
 ## References
 
-Inspired by and builds on ideas from:
+This is a personal project. Inspired by and builds on ideas from:
 
-- [cmux](https://github.com/jnoortheen/cmux) — Claude session manager for tmux
-- [zellaude](https://github.com/nag763/zellaude) — Zellij + Claude automation
-- [claude-zellij-whip](https://github.com/kennethnym/claude-zellij-whip) — Claude Code in Zellij workflows
-- [zellij-pane-picker](https://github.com/Jikstra/zellij-pane-picker) — Fuzzy pane picker plugin
+**Zellij + Claude Code**
+- [claude-code-zellij-status](https://github.com/thoo/claude-code-zellij-status) — Monitor Claude Code activity via zjstatus
+- [claude-zellij-whip](https://github.com/rvcas/claude-zellij-whip) — Claude Code notifications for Zellij with pane focusing
+
+**Zellij Plugins**
 - [zjstatus](https://github.com/dj95/zjstatus) — Configurable Zellij status bar
+- [room](https://github.com/rvcas/room) — Fuzzy tab switcher
+- [harpoon](https://github.com/Nacho114/harpoon) — Pane bookmarks (nvim-harpoon port)
+- [zellij-pane-picker](https://github.com/shihanng/zellij-pane-picker) — Floating pane switcher with filtering and starring
+
+**Claude Code Session Management**
+- [claude-code-tools](https://github.com/pchalasani/claude-code-tools) — Productivity tools for Claude Code (tmux workflows, hooks)
+- [recon](https://github.com/gavraz/recon) — tmux dashboard for Claude Code agents
+- [tmux-agent-indicator](https://github.com/accessd/tmux-agent-indicator) — Hooks-driven AI agent state visualization for tmux
 
 ## License
 

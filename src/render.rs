@@ -30,29 +30,16 @@ pub fn render(state: &State, rows: usize, cols: usize) {
 
     let accent = "#648CF0";
     let muted = "#6c7086";
+
     // Header
-    let header = format!(
-        "{}{} claude-pane {}{}",
-        fg(accent),
-        BOLD,
-        RESET,
-        fg(muted),
-    );
-    println!("{}", header);
+    println!("{}{} claude-pane {}", fg(accent), BOLD, RESET);
 
     // Search bar
-    let search_icon = if state.search_query.is_empty() {
-        format!("{}/ search...{}", fg(muted), RESET)
+    if state.search_query.is_empty() {
+        println!("{}/ search...{}", fg(muted), RESET);
     } else {
-        format!(
-            "{}/ {}{}{}",
-            fg(accent),
-            BOLD,
-            state.search_query,
-            RESET
-        )
-    };
-    println!("{}", search_icon);
+        println!("{}/ {}{}{}", fg(accent), BOLD, state.search_query, RESET);
+    }
     println!();
 
     // Available rows for pane list (header=2 + blank=1 + footer=2)
@@ -63,32 +50,17 @@ pub fn render(state: &State, rows: usize, cols: usize) {
 
     let entries = &state.filtered_entries;
 
-    if entries.is_empty() {
-        println!(
-            "{}  No matches{}",
-            fg(muted),
-            RESET
-        );
+    let lines_used = if entries.is_empty() {
+        println!("{}  No matches{}", fg(muted), RESET);
+        1
+    } else if state.search_query.is_empty() {
+        render_grouped(state, list_rows, cols)
     } else {
-        // Scrolling window around selected_index
-        let total = entries.len();
-        let start = if state.selected_index >= list_rows {
-            state.selected_index - list_rows + 1
-        } else {
-            0
-        };
-        let end = (start + list_rows).min(total);
+        render_flat(state, list_rows, cols)
+    };
 
-        for (i, entry) in entries.iter().enumerate().skip(start).take(end - start) {
-            render_entry(state, entry, i == state.selected_index, cols);
-        }
-    }
-
-    // Footer
-    let blank_lines = rows
-        .saturating_sub(5)
-        .saturating_sub(entries.len().min(list_rows));
-    for _ in 0..blank_lines {
+    // Footer padding
+    for _ in 0..list_rows.saturating_sub(lines_used) {
         println!();
     }
 
@@ -103,10 +75,105 @@ pub fn render(state: &State, rows: usize, cols: usize) {
     );
 }
 
-fn render_entry(state: &State, entry: &PaneEntry, selected: bool, cols: usize) {
+// ---------------------------------------------------------------------------
+// Tab-grouped view (no search)
+// ---------------------------------------------------------------------------
+
+enum VisualItem<'a> {
+    TabHeader { name: &'a str, active: bool },
+    Entry(usize, &'a PaneEntry),
+}
+
+fn render_grouped(state: &State, list_rows: usize, cols: usize) -> usize {
+    let entries = &state.filtered_entries;
+    let muted = "#6c7086";
+    let accent = "#648CF0";
+
+    // Build visual items: tab headers interleaved with entries
+    let mut items: Vec<VisualItem> = Vec::new();
+    let mut prev_tab: Option<usize> = None;
+    let active_tab = state.tabs.iter().find(|t| t.active).map(|t| t.position);
+
+    for (i, entry) in entries.iter().enumerate() {
+        if prev_tab != Some(entry.tab_index) {
+            items.push(VisualItem::TabHeader {
+                name: &entry.tab_name,
+                active: active_tab == Some(entry.tab_index),
+            });
+            prev_tab = Some(entry.tab_index);
+        }
+        items.push(VisualItem::Entry(i, entry));
+    }
+
+    // Find visual position of selected entry
+    let selected_visual = items
+        .iter()
+        .position(|item| matches!(item, VisualItem::Entry(i, _) if *i == state.selected_index))
+        .unwrap_or(0);
+
+    // Scroll window centered on selection
+    let total = items.len();
+    let start = if selected_visual >= list_rows {
+        selected_visual - list_rows + 1
+    } else {
+        0
+    };
+    let end = (start + list_rows).min(total);
+    let visible = end - start;
+
+    for item in items.iter().skip(start).take(visible) {
+        match item {
+            VisualItem::TabHeader { name, active } => {
+                if *active {
+                    println!("{}{}▸ {}{}", fg(accent), BOLD, name, RESET);
+                } else {
+                    println!("{}  {}{}", fg(muted), name, RESET);
+                }
+            }
+            VisualItem::Entry(i, entry) => {
+                render_entry(state, entry, *i == state.selected_index, false, cols);
+            }
+        }
+    }
+
+    visible
+}
+
+// ---------------------------------------------------------------------------
+// Flat view (search active)
+// ---------------------------------------------------------------------------
+
+fn render_flat(state: &State, list_rows: usize, cols: usize) -> usize {
+    let entries = &state.filtered_entries;
+    let total = entries.len();
+    let start = if state.selected_index >= list_rows {
+        state.selected_index - list_rows + 1
+    } else {
+        0
+    };
+    let end = (start + list_rows).min(total);
+    let visible = end - start;
+
+    for (i, entry) in entries.iter().enumerate().skip(start).take(visible) {
+        render_entry(state, entry, i == state.selected_index, true, cols);
+    }
+
+    visible
+}
+
+// ---------------------------------------------------------------------------
+// Entry rendering
+// ---------------------------------------------------------------------------
+
+fn render_entry(
+    state: &State,
+    entry: &PaneEntry,
+    selected: bool,
+    show_tab: bool,
+    cols: usize,
+) {
     let mut line = String::with_capacity(cols);
 
-    // Selection indicator
     if selected {
         line.push_str(REVERSE);
     }
@@ -148,24 +215,26 @@ fn render_entry(state: &State, entry: &PaneEntry, selected: bool, cols: usize) {
         }
     }
 
-    // Tab name
-    line.push_str(DIM);
-    let tab_display = truncate(&entry.tab_name, 12);
-    line.push_str(&tab_display);
-    line.push_str(RESET);
-    if selected {
-        line.push_str(REVERSE);
+    // Tab name (only in flat/search mode)
+    if show_tab {
+        line.push_str(DIM);
+        line.push_str(&truncate(&entry.tab_name, 12));
+        line.push_str(RESET);
+        if selected {
+            line.push_str(REVERSE);
+        }
+        line.push_str(" \u{2502} "); // │
     }
-    line.push_str(" \u{2502} "); // │
 
     // Title / project name
+    let max_label = if show_tab { 24 } else { 30 };
     if let Some(ref session) = entry.session {
         let label = session
             .project_name
             .as_deref()
             .unwrap_or(&entry.title);
         line.push_str(BOLD);
-        line.push_str(&truncate(label, 24));
+        line.push_str(&truncate(label, max_label));
         line.push_str(RESET);
         if selected {
             line.push_str(REVERSE);
@@ -184,7 +253,8 @@ fn render_entry(state: &State, entry: &PaneEntry, selected: bool, cols: usize) {
             }
         }
     } else {
-        line.push_str(&truncate(&entry.title, 36));
+        let max_title = if show_tab { 36 } else { 42 };
+        line.push_str(&truncate(&entry.title, max_title));
     }
 
     line.push_str(RESET);
