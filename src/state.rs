@@ -78,39 +78,6 @@ impl Activity {
     pub fn is_running(self) -> bool {
         !matches!(self, Self::Idle | Self::Done)
     }
-
-    pub fn priority(self) -> u8 {
-        match self {
-            Self::Idle => 0,
-            Self::Done => 1,
-            Self::Thinking => 2,
-            Self::Reading => 3,
-            Self::Writing => 4,
-            Self::BashExec => 5,
-            Self::WebSearch => 5,
-            Self::Agent | Self::Mcp => 5,
-            Self::Notification => 8,
-            Self::PermissionNeeded => 9,
-        }
-    }
-}
-
-/// Strip leading activity symbols from a tab name to recover the base name.
-pub fn strip_activity_prefix(name: &str) -> &str {
-    const SYMBOLS: &[char] = &['◐', '◎', '✎', '⚡', '◍', '▶', '✓', '⚠', '?', '○'];
-    let mut s = name;
-    loop {
-        let trimmed = s.trim_start();
-        if trimmed.is_empty() {
-            return s;
-        }
-        let first = trimmed.chars().next().unwrap();
-        if SYMBOLS.contains(&first) {
-            s = &trimmed[first.len_utf8()..];
-        } else {
-            return trimmed;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -119,7 +86,6 @@ pub fn strip_activity_prefix(name: &str) -> &str {
 
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
-    pub pane_id: u32,
     pub activity: Activity,
     pub tab_index: Option<usize>,
     pub tab_name: Option<String>,
@@ -133,9 +99,8 @@ pub struct SessionInfo {
 }
 
 impl SessionInfo {
-    pub fn new(pane_id: u32, activity: Activity, now: f64) -> Self {
+    pub fn new(activity: Activity, now: f64) -> Self {
         Self {
-            pane_id,
             activity,
             tab_index: None,
             tab_name: None,
@@ -155,14 +120,24 @@ impl SessionInfo {
 #[derive(Debug, Deserialize)]
 pub struct HookPayload {
     pub pane_id: u32,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub session_id: Option<String>,
     pub hook_event: String,
     #[serde(default)]
     pub tool_name: Option<String>,
     #[serde(default)]
     pub project_name: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// FocusPayload (from dashboard pipe message)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct FocusPayload {
+    pub pane_id: u32,
+    #[serde(default)]
+    pub flash_color: Option<String>,
+    #[serde(default)]
+    pub flash_duration_ms: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,14 +170,9 @@ pub struct Config {
     // Display
     pub show_elapsed_time: bool,
     pub show_non_claude: bool,
-    pub show_pane_id: bool,
 
     // Focus highlight
     pub focus_highlight_s: f64,
-
-    // zjstatus
-    pub zjstatus_pipe: bool,
-    pub zjstatus_url: String,
 }
 
 impl Default for Config {
@@ -220,10 +190,7 @@ impl Default for Config {
             idle_remove_s: 300.0,
             show_elapsed_time: true,
             show_non_claude: true,
-            show_pane_id: true,
             focus_highlight_s: 0.5,
-            zjstatus_pipe: true,
-            zjstatus_url: "file:~/.config/zellij/plugins/zjstatus.wasm".into(),
         }
     }
 }
@@ -272,19 +239,9 @@ impl Config {
         if let Some(v) = map.get("show_non_claude") {
             cfg.show_non_claude = v != "false";
         }
-        if let Some(v) = map.get("show_pane_id") {
-            cfg.show_pane_id = v != "false";
-        }
         if let Some(v) = map.get("focus_highlight_s") {
             cfg.focus_highlight_s = v.parse().unwrap_or(cfg.focus_highlight_s);
         }
-        if let Some(v) = map.get("zjstatus_pipe") {
-            cfg.zjstatus_pipe = v != "false";
-        }
-        if let Some(v) = map.get("zjstatus_url") {
-            cfg.zjstatus_url = v.clone();
-        }
-
         cfg
     }
 
@@ -315,8 +272,6 @@ pub struct PaneEntry {
     pub tab_index: usize,
     pub tab_name: String,
     pub title: String,
-    pub is_plugin: bool,
-    pub is_focused: bool,
     /// Claude session info if this pane has one
     pub session: Option<SessionInfo>,
     pub is_starred: bool,
@@ -341,10 +296,14 @@ pub struct State {
     pub selected_index: usize,
     pub filtered_entries: Vec<PaneEntry>,
     pub collapsed_tabs: std::collections::HashSet<usize>,
+    /// Entry indices for jump keys 1-9 (set by render, used by handle_key)
+    pub jump_targets: Vec<usize>,
 
     // Focus tracking
     pub current_focus_pane: Option<u32>,
     pub previous_focus_pane: Option<u32>,
+    /// Last pane focused via star cycling (for consistent next/prev)
+    pub last_starred_pane: Option<u32>,
 
     // Focus highlight (pane_id → expiry deadline, applied once)
     pub focus_highlights: BTreeMap<u32, f64>,
@@ -356,9 +315,6 @@ pub struct State {
     pub uptime_s: f64,
     pub tick_count: u64,
     pub permissions_granted: bool,
-
-    // zjstatus debounce
-    pub last_zjstatus_update: f64,
 
     // Cached running commands (pane_id → basename), refreshed on palette open
     pub running_command_cache: HashMap<u32, String>,
@@ -379,9 +335,11 @@ impl Default for State {
             selected_index: 0,
             filtered_entries: Vec::new(),
             collapsed_tabs: std::collections::HashSet::new(),
+            jump_targets: Vec::new(),
 
             current_focus_pane: None,
             previous_focus_pane: None,
+            last_starred_pane: None,
 
             focus_highlights: BTreeMap::new(),
 
@@ -391,8 +349,6 @@ impl Default for State {
             uptime_s: 0.0,
             tick_count: 0,
             permissions_granted: false,
-
-            last_zjstatus_update: 0.0,
 
             running_command_cache: HashMap::new(),
         }
@@ -467,8 +423,6 @@ impl State {
                     tab_index: tab_idx,
                     tab_name: tab_name.clone(),
                     title: pane.title.clone(),
-                    is_plugin: pane.is_plugin,
-                    is_focused: pane.is_focused,
                     session: self.sessions.get(&pane.id).cloned(),
                     is_starred: self.stars.contains(pane.id),
                     running_command: pane.terminal_command.clone(),
@@ -491,27 +445,6 @@ impl State {
 // ---------------------------------------------------------------------------
 // Free functions (testable without WASM host)
 // ---------------------------------------------------------------------------
-
-/// Format sessions for zjstatus pipe_status markup.
-pub fn format_zjstatus(sessions: &BTreeMap<u32, SessionInfo>) -> String {
-    if sessions.is_empty() {
-        return String::new();
-    }
-    sessions
-        .values()
-        .map(|s| {
-            let fallback = format!("pane {}", s.pane_id);
-            let label = s.project_name.as_deref().unwrap_or(&fallback);
-            format!(
-                "#[fg={}]{} {}",
-                s.activity.color(),
-                s.activity.symbol(),
-                label
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("  ")
-}
 
 /// Format elapsed time as human-readable string.
 pub fn format_elapsed(seconds: f64) -> String {

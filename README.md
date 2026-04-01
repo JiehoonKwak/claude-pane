@@ -1,16 +1,16 @@
-# claude-pane
+# zellij-pane-palette
 
-A [Zellij](https://zellij.dev) WASM plugin that manages multiple [Claude Code](https://docs.anthropic.com/en/docs/claude-code) sessions across tabs and panes.
+A [Zellij](https://zellij.dev) WASM plugin for managing AI coding sessions and panes — fuzzy search, bookmarks, process display, and background notifications.
 
-![claude-pane command palette](assets/screenshot.png)
+![pane-palette command palette](assets/screenshot.png)
 
 ## Features
 
-- **zjstatus integration** — activity symbols in your status bar (⚡ ✎ ◎ ✓ ⚠), notification-only tab indicators
+- **Command palette** — fuzzy-searchable pane picker with fold/unfold tabs, jump numbers (1-9), running command display
 - **Background flash** — pane background blinks when Claude needs attention (permission, notification); clears on focus
-- **Command palette** — fuzzy-searchable pane picker with fold/unfold tabs, number selection (1-9), process name display
 - **Star bookmarks** — pin important panes, cycle through them with Alt+U/I across tabs
-- **Running indicator** — orange dot shows which Claude sessions are actively running
+- **Running indicator** — orange text for active Claude sessions, green for Codex
+- **Process display** — shows foreground process for all panes (zsh, nvim, claude, codex, etc.)
 - **Hook bridge** — zero-config if you use Claude Code's hook system
 
 ## Quick Start
@@ -18,7 +18,6 @@ A [Zellij](https://zellij.dev) WASM plugin that manages multiple [Claude Code](h
 ### Requirements
 
 - Zellij >= 0.44.0
-- [zjstatus](https://github.com/dj95/zjstatus) (optional, for status bar symbols)
 
 ### Install
 
@@ -28,13 +27,13 @@ Open Claude Code inside Zellij and run `/install`. The skill detects your enviro
 
 **Option B: Manual**
 
-1. Download `claude_pane.wasm` from the [latest release](https://github.com/jiehoonk/claude-pane/releases)
-2. Copy to `~/.config/zellij/plugins/claude-pane.wasm`
+1. Download `zellij-pane-palette.wasm` from the [latest release](https://github.com/jiehoonk/zellij-pane-palette/releases)
+2. Copy to `~/.config/zellij/plugins/zellij-pane-palette.wasm`
 3. Add to your `config.kdl`:
 
 ```kdl
 plugins {
-    claude-pane location="file:~/.config/zellij/plugins/claude-pane.wasm" {
+    pane-palette location="file:~/.config/zellij/plugins/zellij-pane-palette.wasm" {
         notification_flash "persist"
         done_timeout_s     "30"
         idle_remove_s      "300"
@@ -42,7 +41,7 @@ plugins {
 }
 
 load_plugins {
-    "claude-pane"
+    "pane-palette"
 }
 ```
 
@@ -52,17 +51,17 @@ load_plugins {
 keybinds {
     locked {
         bind "Alt o" {
-            MessagePlugin "claude-pane" {
+            MessagePlugin "pane-palette" {
                 name "show"
             }
         }
         bind "Alt u" {
-            MessagePlugin "claude-pane" {
+            MessagePlugin "pane-palette" {
                 name "star-prev"
             }
         }
         bind "Alt i" {
-            MessagePlugin "claude-pane" {
+            MessagePlugin "pane-palette" {
                 name "star-next"
             }
         }
@@ -73,8 +72,8 @@ keybinds {
 5. Register the hook bridge:
 
 ```bash
-cp scripts/claude-pane-hook.sh ~/.config/zellij/plugins/
-chmod +x ~/.config/zellij/plugins/claude-pane-hook.sh
+cp scripts/pane-palette-hook.sh ~/.config/zellij/plugins/
+chmod +x ~/.config/zellij/plugins/pane-palette-hook.sh
 ```
 
 Add to `~/.claude/settings.json`:
@@ -82,20 +81,13 @@ Add to `~/.claude/settings.json`:
 ```json
 {
   "hooks": {
-    "PreToolUse": [{ "command": "~/.config/zellij/plugins/claude-pane-hook.sh" }],
-    "PostToolUse": [{ "command": "~/.config/zellij/plugins/claude-pane-hook.sh" }],
-    "Notification": [{ "command": "~/.config/zellij/plugins/claude-pane-hook.sh" }],
-    "Stop": [{ "command": "~/.config/zellij/plugins/claude-pane-hook.sh" }],
-    "UserPromptSubmit": [{ "command": "~/.config/zellij/plugins/claude-pane-hook.sh" }]
+    "PreToolUse": [{ "command": "~/.config/zellij/plugins/pane-palette-hook.sh" }],
+    "PostToolUse": [{ "command": "~/.config/zellij/plugins/pane-palette-hook.sh" }],
+    "Notification": [{ "command": "~/.config/zellij/plugins/pane-palette-hook.sh" }],
+    "Stop": [{ "command": "~/.config/zellij/plugins/pane-palette-hook.sh" }],
+    "UserPromptSubmit": [{ "command": "~/.config/zellij/plugins/pane-palette-hook.sh" }]
   }
 }
-```
-
-6. If using zjstatus, add to your layout:
-
-```kdl
-format_right "{pipe_status} {session}"
-pipe_status_rendermode "dynamic"
 ```
 
 ## Command Palette
@@ -115,13 +107,14 @@ pipe_status_rendermode "dynamic"
 
 | Name | Payload | Effect |
 |------|---------|--------|
-| `show` / `claude-pane:show` | — | Open palette |
-| `hide` / `claude-pane:hide` | — | Close palette |
-| `star-next` / `claude-pane:star-next` | — | Focus next starred pane |
-| `star-prev` / `claude-pane:star-prev` | — | Focus previous starred pane |
-| `claude-pane:event` / `event` | HookPayload JSON | Upsert session |
-| `dump-state` / `claude-pane:dump-state` | — | Write state diagnostic |
-| `test` / `claude-pane:test` | — | Test ping |
+| `show` / `pane-palette:show` | — | Open palette |
+| `hide` / `pane-palette:hide` | — | Close palette |
+| `star-next` / `pane-palette:star-next` | — | Focus next starred pane |
+| `star-prev` / `pane-palette:star-prev` | — | Focus previous starred pane |
+| `focus` / `pane-palette:focus` | FocusPayload JSON | Direct pane focus with flash |
+| `pane-palette:event` / `event` | HookPayload JSON | Upsert session |
+| `dump-state` / `pane-palette:dump-state` | — | Write state diagnostic |
+| `test` / `pane-palette:test` | — | Test ping |
 
 ## Activity Symbols
 
@@ -140,7 +133,7 @@ pipe_status_rendermode "dynamic"
 ## Configuration
 
 ```kdl
-claude-pane location="file:~/.config/zellij/plugins/claude-pane.wasm" {
+pane-palette location="file:~/.config/zellij/plugins/zellij-pane-palette.wasm" {
     // Palette keybindings
     key_select_down    "j"
     key_select_up      "k"
@@ -158,10 +151,9 @@ claude-pane location="file:~/.config/zellij/plugins/claude-pane.wasm" {
     // Display
     show_elapsed_time  "true"
     show_non_claude    "true"
-    show_pane_id       "true"
 
-    // zjstatus
-    zjstatus_pipe      "true"
+    // Focus highlight
+    focus_highlight_s  "0.5"
 }
 ```
 
@@ -170,7 +162,7 @@ claude-pane location="file:~/.config/zellij/plugins/claude-pane.wasm" {
 ```bash
 rustup target add wasm32-wasip1
 cargo build --release
-# → target/wasm32-wasip1/release/claude-pane.wasm
+# → target/wasm32-wasip1/release/zellij-pane-palette.wasm
 ```
 
 ## References
@@ -180,15 +172,7 @@ cargo build --release
 - [claude-zellij-whip](https://github.com/rvcas/claude-zellij-whip) — Claude Code notifications for Zellij with pane focusing
 
 **Zellij Plugins**
-- [zjstatus](https://github.com/dj95/zjstatus) — Configurable Zellij status bar
-- [room](https://github.com/rvcas/room) — Fuzzy tab switcher
-- [harpoon](https://github.com/Nacho114/harpoon) — Pane bookmarks (nvim-harpoon port)
 - [zellij-pane-picker](https://github.com/shihanng/zellij-pane-picker) — Floating pane switcher with filtering and starring
-
-**Claude Code Session Management**
-- [claude-code-tools](https://github.com/pchalasani/claude-code-tools) — Productivity tools for Claude Code (tmux workflows, hooks)
-- [recon](https://github.com/gavraz/recon) — tmux dashboard for Claude Code agents
-- [tmux-agent-indicator](https://github.com/accessd/tmux-agent-indicator) — Hooks-driven AI agent state visualization for tmux
 
 ## License
 

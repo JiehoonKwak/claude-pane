@@ -37,22 +37,53 @@ pub fn fuzzy_filter(query: &str, entries: Vec<PaneEntry>) -> Vec<PaneEntry> {
 
 /// Query OS for running commands and cache in State.
 /// Called once on palette open, not on every keystroke.
+/// Also marks stale sessions as Done when process is no longer "claude".
 #[cfg(target_arch = "wasm32")]
 pub fn refresh_running_commands(state: &mut State) {
     use zellij_tile::prelude::*;
     state.running_command_cache.clear();
     for panes in state.pane_manifest.values() {
         for pane in panes {
-            if !pane.is_plugin && !state.sessions.contains_key(&pane.id) {
-                if let Ok(cmd) = get_pane_running_command(PaneId::Terminal(pane.id)) {
-                    if let Some(bin) = cmd.first() {
-                        let basename = bin.rsplit('/').next().unwrap_or(bin);
-                        state
-                            .running_command_cache
-                            .insert(pane.id, basename.to_string());
-                    }
+            if pane.is_plugin {
+                continue;
+            }
+            if let Ok(cmd) = get_pane_running_command(PaneId::Terminal(pane.id)) {
+                if let Some(bin) = cmd.first() {
+                    let basename = bin.rsplit('/').next().unwrap_or(bin);
+                    state
+                        .running_command_cache
+                        .insert(pane.id, basename.to_string());
                 }
             }
+        }
+    }
+
+    // Mark sessions as Done when stale by time AND foreground is a shell.
+    // Only shell (zsh/bash/fish/sh) indicates Claude has exited — any other
+    // process (git, pytest, node, etc.) could be a running tool invocation.
+    let stale_threshold = state.config.done_timeout_s * 2.0;
+    let now = state.uptime_s;
+    let shells: &[&str] = &["zsh", "bash", "fish", "sh"];
+    let stale: Vec<u32> = state
+        .sessions
+        .iter()
+        .filter(|(&id, session)| {
+            session.activity.is_running()
+                && !session.activity.is_attention()
+                && (now - session.last_event_ts) > stale_threshold
+                && state
+                    .running_command_cache
+                    .get(&id)
+                    .map(|cmd| shells.iter().any(|&s| cmd == s))
+                    .unwrap_or(false)
+        })
+        .map(|(&id, _)| id)
+        .collect();
+
+    for id in stale {
+        if let Some(s) = state.sessions.get_mut(&id) {
+            s.activity = crate::state::Activity::Done;
+            s.last_event_ts = now;
         }
     }
 }

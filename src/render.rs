@@ -23,7 +23,7 @@ fn parse_hex(hex: &str) -> (u8, u8, u8) {
 }
 
 /// Render the floating command palette.
-pub fn render(state: &State, rows: usize, cols: usize) {
+pub fn render(state: &mut State, rows: usize, cols: usize) {
     if !state.visible {
         return;
     }
@@ -32,7 +32,7 @@ pub fn render(state: &State, rows: usize, cols: usize) {
     let muted = "#6c7086";
 
     // Header
-    println!("{}{} claude-pane {}", fg(accent), BOLD, RESET);
+    println!("{}{} pane-palette {}", fg(accent), BOLD, RESET);
 
     // Search bar
     if state.search_query.is_empty() {
@@ -49,6 +49,8 @@ pub fn render(state: &State, rows: usize, cols: usize) {
     }
 
     let entries = &state.filtered_entries;
+
+    state.jump_targets.clear();
 
     let lines_used = if entries.is_empty() {
         println!("{}  No matches{}", fg(muted), RESET);
@@ -86,7 +88,7 @@ enum VisualItem<'a> {
     Entry(usize, &'a PaneEntry),
 }
 
-fn render_grouped(state: &State, list_rows: usize, cols: usize) -> usize {
+fn render_grouped(state: &mut State, list_rows: usize, cols: usize) -> usize {
     let entries = &state.filtered_entries;
     let muted = "#6c7086";
     let accent = "#648CF0";
@@ -137,6 +139,19 @@ fn render_grouped(state: &State, list_rows: usize, cols: usize) -> usize {
     let end = (start + list_rows).min(total);
     let visible = end - start;
 
+    // Build jump number mapping from the VISIBLE window only
+    let mut jump_num: u8 = 0;
+    let mut jump_map: std::collections::HashMap<usize, u8> = std::collections::HashMap::new();
+    for item in items.iter().skip(start).take(visible) {
+        if let VisualItem::Entry(i, _) = item {
+            jump_num += 1;
+            if jump_num <= 9 {
+                jump_map.insert(*i, jump_num);
+                state.jump_targets.push(*i);
+            }
+        }
+    }
+
     for item in items.iter().skip(start).take(visible) {
         match item {
             VisualItem::TabHeader {
@@ -162,7 +177,8 @@ fn render_grouped(state: &State, list_rows: usize, cols: usize) -> usize {
                 }
             }
             VisualItem::Entry(i, entry) => {
-                render_entry(state, entry, *i == state.selected_index, false, cols);
+                let num = jump_map.get(i).copied();
+                render_entry(state, entry, *i == state.selected_index, false, cols, num);
             }
         }
     }
@@ -174,7 +190,7 @@ fn render_grouped(state: &State, list_rows: usize, cols: usize) -> usize {
 // Flat view (search active)
 // ---------------------------------------------------------------------------
 
-fn render_flat(state: &State, list_rows: usize, cols: usize) -> usize {
+fn render_flat(state: &mut State, list_rows: usize, cols: usize) -> usize {
     let entries = &state.filtered_entries;
     let total = entries.len();
     let start = if state.selected_index >= list_rows {
@@ -185,8 +201,16 @@ fn render_flat(state: &State, list_rows: usize, cols: usize) -> usize {
     let end = (start + list_rows).min(total);
     let visible = end - start;
 
+    let mut jump_num: u8 = 0;
     for (i, entry) in entries.iter().enumerate().skip(start).take(visible) {
-        render_entry(state, entry, i == state.selected_index, true, cols);
+        jump_num += 1;
+        let num = if jump_num <= 9 {
+            state.jump_targets.push(i);
+            Some(jump_num)
+        } else {
+            None
+        };
+        render_entry(state, entry, i == state.selected_index, true, cols, num);
     }
 
     visible
@@ -202,11 +226,24 @@ fn render_entry(
     selected: bool,
     show_tab: bool,
     cols: usize,
+    jump_num: Option<u8>,
 ) {
     let mut line = String::with_capacity(cols);
 
     if selected {
         line.push_str(REVERSE);
+    }
+
+    // Jump number
+    if let Some(n) = jump_num {
+        line.push_str(&fg("#6c7086"));
+        line.push_str(&format!("{:<2}", n));
+        line.push_str(RESET);
+        if selected {
+            line.push_str(REVERSE);
+        }
+    } else {
+        line.push_str("  ");
     }
 
     // Star
@@ -236,16 +273,6 @@ fn render_entry(
         line.push_str("  ");
     }
 
-    // Pane ID
-    if state.config.show_pane_id {
-        line.push_str(&fg("#6c7086"));
-        line.push_str(&format!("#{:<3} ", entry.pane_id));
-        line.push_str(RESET);
-        if selected {
-            line.push_str(REVERSE);
-        }
-    }
-
     // Tab name (only in flat/search mode)
     if show_tab {
         line.push_str(DIM);
@@ -257,18 +284,40 @@ fn render_entry(
         line.push_str(" \u{2502} "); // │
     }
 
-    // Title / project name / process name
+    // Running command + title/project
     let max_label = if show_tab { 24 } else { 30 };
-    if let Some(ref session) = entry.session {
-        let label = session
-            .project_name
-            .as_deref()
-            .unwrap_or(&entry.title);
-        // Orange name when running, default bold when idle/done
+    let cmd = entry.running_command.as_deref().unwrap_or("");
+    let is_codex = cmd.contains("codex");
+    let is_claude = entry.session.is_some();
+
+    if is_claude {
+        // Claude session: orange command when running
+        let session = entry.session.as_ref().unwrap();
+        if !cmd.is_empty() {
+            if session.activity.is_running() {
+                line.push_str(&fg("#ff851b"));
+            } else {
+                line.push_str(&fg("#a9b1d6"));
+            }
+            line.push_str(BOLD);
+            line.push_str(cmd);
+            line.push_str(RESET);
+            if selected {
+                line.push_str(REVERSE);
+            }
+            line.push(' ');
+        }
+
+        // Project name or title
+        let label = session.project_name.as_deref().unwrap_or(&entry.title);
         if session.activity.is_running() {
             line.push_str(&fg("#ff851b"));
         }
-        line.push_str(BOLD);
+        if !cmd.is_empty() {
+            line.push_str(DIM);
+        } else {
+            line.push_str(BOLD);
+        }
         line.push_str(&truncate(label, max_label));
         line.push_str(RESET);
         if selected {
@@ -287,10 +336,23 @@ fn render_entry(
                 }
             }
         }
+    } else if is_codex {
+        // Codex pane: green command
+        line.push_str(&fg("#10a37f"));
+        line.push_str(BOLD);
+        line.push_str(cmd);
+        line.push_str(RESET);
+        if selected {
+            line.push_str(REVERSE);
+        }
+        line.push(' ');
+        line.push_str(DIM);
+        line.push_str(&truncate(&entry.title, max_label));
+        line.push_str(RESET);
     } else {
-        // Non-Claude pane: show running_command prominently, then dim title
+        // Regular pane
         let max_title: usize = if show_tab { 36 } else { 42 };
-        if let Some(ref cmd) = entry.running_command {
+        if !cmd.is_empty() {
             line.push_str(&fg("#a9b1d6"));
             line.push_str(BOLD);
             line.push_str(cmd);
@@ -300,7 +362,10 @@ fn render_entry(
             }
             line.push(' ');
             line.push_str(DIM);
-            line.push_str(&truncate(&entry.title, max_title.saturating_sub(cmd.len() + 1)));
+            line.push_str(&truncate(
+                &entry.title,
+                max_title.saturating_sub(cmd.len() + 1),
+            ));
             line.push_str(RESET);
         } else {
             line.push_str(&truncate(&entry.title, max_title));

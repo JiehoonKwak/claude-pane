@@ -1,9 +1,9 @@
 [package]
-name = "claude-pane"
-version = "0.2.0"
+name = "zellij-pane-palette"
+version = "0.3.0"
 edition = "2021"
 authors = ["jiehoonk"]
-description = "Zellij plugin for Claude Code session management"
+description = "Zellij WASM plugin — AI pane palette with fuzzy search, bookmarks, and process display"
 license = "MIT"
 
 [dependencies]

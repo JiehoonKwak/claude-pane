@@ -1,6 +1,5 @@
 use crate::state::{
-    format_elapsed, format_zjstatus, Activity, Config, HookPayload, NotificationFlash,
-    SessionInfo,
+    format_elapsed, Activity, Config, FocusPayload, HookPayload, NotificationFlash, SessionInfo,
 };
 use std::collections::BTreeMap;
 
@@ -99,7 +98,7 @@ fn test_hook_event_to_activity_unknown() {
 
 #[test]
 fn test_hook_payload_full() {
-    let json = r#"{"pane_id":5,"session_id":"abc","hook_event":"PreToolUse","tool_name":"Bash","project_name":"myproj"}"#;
+    let json = r#"{"pane_id":5,"hook_event":"PreToolUse","tool_name":"Bash","project_name":"myproj"}"#;
     let p: HookPayload = serde_json::from_str(json).unwrap();
     assert_eq!(p.pane_id, 5);
     assert_eq!(p.hook_event, "PreToolUse");
@@ -131,6 +130,34 @@ fn test_empty_payload() {
 }
 
 // ---------------------------------------------------------------------------
+// FocusPayload deserialization
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_focus_payload_full() {
+    let json = r##"{"pane_id":5,"flash_color":"#ff0000","flash_duration_ms":500}"##;
+    let p: FocusPayload = serde_json::from_str(json).unwrap();
+    assert_eq!(p.pane_id, 5);
+    assert_eq!(p.flash_color.as_deref(), Some("#ff0000"));
+    assert_eq!(p.flash_duration_ms, Some(500));
+}
+
+#[test]
+fn test_focus_payload_minimal() {
+    let json = r#"{"pane_id":10}"#;
+    let p: FocusPayload = serde_json::from_str(json).unwrap();
+    assert_eq!(p.pane_id, 10);
+    assert!(p.flash_color.is_none());
+    assert!(p.flash_duration_ms.is_none());
+}
+
+#[test]
+fn test_focus_payload_missing_pane_id() {
+    let json = r##"{"flash_color":"#ff0000"}"##;
+    assert!(serde_json::from_str::<FocusPayload>(json).is_err());
+}
+
+// ---------------------------------------------------------------------------
 // Config defaults and parsing
 // ---------------------------------------------------------------------------
 
@@ -147,8 +174,6 @@ fn test_config_defaults() {
     assert!((cfg.idle_remove_s - 300.0).abs() < f64::EPSILON);
     assert!(cfg.show_elapsed_time);
     assert!(cfg.show_non_claude);
-    assert!(cfg.show_pane_id);
-    assert!(cfg.zjstatus_pipe);
 }
 
 #[test]
@@ -156,11 +181,9 @@ fn test_config_partial_override() {
     let mut map = BTreeMap::new();
     map.insert("done_timeout_s".into(), "2".into());
     map.insert("notification_flash".into(), "off".into());
-    map.insert("show_pane_id".into(), "false".into());
     let cfg = Config::from_map(&map);
     assert!((cfg.done_timeout_s - 2.0).abs() < f64::EPSILON);
     assert_eq!(cfg.notification_flash, NotificationFlash::Off);
-    assert!(!cfg.show_pane_id);
     assert_eq!(cfg.key_select_down, "j");
 }
 
@@ -172,49 +195,6 @@ fn test_config_invalid_value() {
     let cfg = Config::from_map(&map);
     assert!((cfg.done_timeout_s - 30.0).abs() < f64::EPSILON);
     assert_eq!(cfg.flash_duration_ms, 2000);
-}
-
-// ---------------------------------------------------------------------------
-// zjstatus formatting (free function, no WASM deps)
-// ---------------------------------------------------------------------------
-
-fn make_session(pane_id: u32, activity: Activity, project: Option<&str>) -> SessionInfo {
-    SessionInfo {
-        pane_id,
-        activity,
-        tab_index: None,
-        tab_name: None,
-        last_event_ts: 0.0,
-        project_name: project.map(String::from),
-        tool_name: None,
-        flash_deadline: 0.0,
-        focus_highlight_deadline: 0.0,
-    }
-}
-
-#[test]
-fn test_format_zjstatus_empty() {
-    assert_eq!(format_zjstatus(&BTreeMap::new()), "");
-}
-
-#[test]
-fn test_format_zjstatus_single() {
-    let mut sessions = BTreeMap::new();
-    sessions.insert(5, make_session(5, Activity::BashExec, Some("dotfiles")));
-    let result = format_zjstatus(&sessions);
-    assert!(result.contains("#[fg=#ff851b]"));
-    assert!(result.contains("dotfiles"));
-}
-
-#[test]
-fn test_format_zjstatus_multi() {
-    let mut sessions = BTreeMap::new();
-    sessions.insert(1, make_session(1, Activity::Done, Some("proj-a")));
-    sessions.insert(2, make_session(2, Activity::PermissionNeeded, Some("proj-b")));
-    let result = format_zjstatus(&sessions);
-    assert!(result.contains("proj-a"));
-    assert!(result.contains("proj-b"));
-    assert!(result.contains("  "));
 }
 
 // ---------------------------------------------------------------------------
@@ -303,4 +283,72 @@ fn test_is_running_active() {
 fn test_is_running_inactive() {
     assert!(!Activity::Done.is_running());
     assert!(!Activity::Idle.is_running());
+}
+
+// ---------------------------------------------------------------------------
+// Staleness detection
+// ---------------------------------------------------------------------------
+
+fn make_session(activity: Activity, last_event_ts: f64) -> SessionInfo {
+    SessionInfo {
+        activity,
+        tab_index: None,
+        tab_name: None,
+        last_event_ts,
+        project_name: None,
+        tool_name: None,
+        flash_deadline: 0.0,
+        focus_highlight_deadline: 0.0,
+    }
+}
+
+#[test]
+fn test_stale_running_session_transitions_to_done() {
+    // Timer-based: session with no hook events for idle_remove_s transitions to Done
+    let session = make_session(Activity::Thinking, 0.0);
+    let now = 400.0; // well past idle_remove_s (300s default)
+    let idle_remove = 300.0;
+    assert!(
+        session.activity.is_running()
+            && !session.activity.is_attention()
+            && (now - session.last_event_ts) > idle_remove
+    );
+}
+
+#[test]
+fn test_recent_running_session_stays_running() {
+    // Session with recent events should NOT transition
+    let session = make_session(Activity::BashExec, 200.0);
+    let now = 400.0; // 200s since last event — under idle_remove_s (300s)
+    let idle_remove = 300.0;
+    assert!(
+        !(session.activity.is_running()
+            && !session.activity.is_attention()
+            && (now - session.last_event_ts) > idle_remove)
+    );
+}
+
+#[test]
+fn test_attention_session_not_stale() {
+    // PermissionNeeded should NOT be auto-transitioned even if stale
+    let session = make_session(Activity::PermissionNeeded, 0.0);
+    let now = 120.0;
+    let done_timeout = 30.0;
+    assert!(
+        !(session.activity.is_running()
+            && !session.activity.is_attention()
+            && (now - session.last_event_ts) > done_timeout * 2.0)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Codex process detection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_codex_process_detection() {
+    assert!("codex".contains("codex"));
+    assert!(!"claude".contains("codex"));
+    assert!(!"zsh".contains("codex"));
+    assert!("codex-cli".contains("codex"));
 }

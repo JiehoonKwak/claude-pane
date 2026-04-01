@@ -214,17 +214,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "claude-pane"
-version = "0.2.0"
-dependencies = [
- "indexmap 2.13.0",
- "nucleo-matcher",
- "serde",
- "serde_json",
- "zellij-tile",
-]
-
-[[package]]
 name = "colored"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2741,6 +2730,17 @@ dependencies = [
  "quote",
  "syn 2.0.117",
  "synstructure",
+]
+
+[[package]]
+name = "zellij-pane-palette"
+version = "0.3.0"
+dependencies = [
+ "indexmap 2.13.0",
+ "nucleo-matcher",
+ "serde",
+ "serde_json",
+ "zellij-tile",
 ]
 
 [[package]]

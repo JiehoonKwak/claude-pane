@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-const PERSIST_PATH: &str = ".config/zellij/plugins/claude-pane.json";
+const PERSIST_PATH: &str = ".config/zellij/plugins/pane-palette.json";
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct StarSet {
@@ -81,8 +81,14 @@ impl StarSet {
     }
 
     fn load() -> Option<Self> {
-        let path = Self::persist_path();
-        let data = std::fs::read_to_string(path).ok()?;
+        let new_path = Self::persist_path();
+        if let Ok(data) = std::fs::read_to_string(&new_path) {
+            return serde_json::from_str(&data).ok();
+        }
+        // Migration: try old path
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let old_path = PathBuf::from(home).join(".config/zellij/plugins/claude-pane.json");
+        let data = std::fs::read_to_string(old_path).ok()?;
         serde_json::from_str(&data).ok()
     }
 

@@ -5,7 +5,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-use state::{Activity, Config, HookPayload, NotificationFlash, State};
+use state::{Activity, Config, FocusPayload, HookPayload, NotificationFlash, State};
 
 #[cfg(target_arch = "wasm32")]
 use zellij_tile::prelude::*;
@@ -46,7 +46,7 @@ impl ZellijPlugin for State {
         self.own_pane_id = Some(ids.plugin_id);
 
         set_timeout(1.0);
-        eprintln!("claude-pane: loaded (v{})", env!("CARGO_PKG_VERSION"));
+        eprintln!("pane-palette: loaded (v{})", env!("CARGO_PKG_VERSION"));
     }
 
     fn update(&mut self, event: Event) -> bool {
@@ -79,7 +79,7 @@ impl ZellijPlugin for State {
             Event::PermissionRequestResult(status) => {
                 if status == PermissionStatus::Granted {
                     self.permissions_granted = true;
-                    eprintln!("claude-pane: permissions granted");
+                    eprintln!("pane-palette: permissions granted");
                 }
                 false
             }
@@ -112,12 +112,12 @@ impl ZellijPlugin for State {
 impl State {
     fn handle_pipe(&mut self, msg: PipeMessage) -> bool {
         match msg.name.as_str() {
-            "claude-pane:event" | "event" => {
+            "pane-palette:event" | "claude-pane:event" | "event" => {
                 if let Some(payload) = &msg.payload {
                     match serde_json::from_str::<HookPayload>(payload) {
                         Ok(hook) => self.handle_hook_event(hook),
                         Err(e) => {
-                            eprintln!("claude-pane: malformed payload: {e}");
+                            eprintln!("pane-palette: malformed payload: {e}");
                             false
                         }
                     }
@@ -125,23 +125,34 @@ impl State {
                     false
                 }
             }
-            "show" | "claude-pane:show" => {
+            "show" | "pane-palette:show" => {
                 self.show_palette();
                 true
             }
-            "hide" | "claude-pane:hide" => {
+            "hide" | "pane-palette:hide" => {
                 self.hide_palette();
                 true
             }
-            "star-next" | "claude-pane:star-next" => {
+            "star-next" | "pane-palette:star-next" => {
                 self.focus_starred_pane(true);
                 false
             }
-            "star-prev" | "claude-pane:star-prev" => {
+            "star-prev" | "pane-palette:star-prev" => {
                 self.focus_starred_pane(false);
                 false
             }
-            "dump-state" | "claude-pane:dump-state" => {
+            "focus" | "pane-palette:focus" => {
+                let pipe_name = msg.name.clone();
+                if let Some(payload) = &msg.payload {
+                    match serde_json::from_str::<FocusPayload>(payload) {
+                        Ok(fp) => self.handle_focus(fp),
+                        Err(e) => eprintln!("pane-palette: focus bad payload: {e}"),
+                    }
+                }
+                unblock_cli_pipe_input(&pipe_name);
+                false
+            }
+            "dump-state" | "pane-palette:dump-state" => {
                 let mut out = String::new();
                 out.push_str(&format!("own_pane_id={:?}\n", self.own_pane_id));
                 for t in &self.tabs {
@@ -158,12 +169,12 @@ impl State {
                         id, s.activity, s.tab_index, s.tab_name, s.project_name));
                 }
                 let home = std::env::var("HOME").unwrap_or_default();
-                let path = format!("{home}/.config/zellij/plugins/claude-pane-dump.txt");
+                let path = format!("{home}/.config/zellij/plugins/pane-palette-dump.txt");
                 let _ = std::fs::write(&path, &out);
                 false
             }
-            "test" | "claude-pane:test" => {
-                eprintln!("claude-pane: test ping OK");
+            "test" | "pane-palette:test" => {
+                eprintln!("pane-palette: test ping OK");
                 false
             }
             _ => false,
@@ -178,9 +189,8 @@ impl State {
         let session = self
             .sessions
             .entry(hook.pane_id)
-            .or_insert_with(|| state::SessionInfo::new(hook.pane_id, activity, now));
+            .or_insert_with(|| state::SessionInfo::new(activity, now));
 
-        let prev_activity = session.activity;
         session.activity = activity;
         session.last_event_ts = now;
 
@@ -200,8 +210,10 @@ impl State {
         {
             let blink_s = self.config.flash_duration_ms as f64 / 1000.0;
             session.flash_deadline = now + blink_s;
-            // For persist mode, keep steady tint after blink ends
-            if self.config.notification_flash == NotificationFlash::Persist {
+            // Only persist tint if pane is NOT currently focused
+            if self.config.notification_flash == NotificationFlash::Persist
+                && self.current_focus_pane != Some(hook.pane_id)
+            {
                 session.focus_highlight_deadline = f64::MAX;
             }
         }
@@ -217,17 +229,12 @@ impl State {
 
         self.rebuild_pane_map();
 
-        if activity != prev_activity {
-            self.update_zjstatus();
-        }
-
         self.visible
     }
 
     fn handle_timer(&mut self) -> bool {
         let now = self.uptime_s;
         let mut any_flash_active = false;
-        let mut need_zjstatus_update = false;
         let mut to_remove: Vec<u32> = Vec::new();
 
         let done_timeout = self.config.done_timeout_s;
@@ -243,20 +250,28 @@ impl State {
             };
 
             if session.flash_deadline > now {
+                // BLINK phase
                 any_flash_active = true;
                 if tick_even {
-                    // Flash ON: subtle background tint
                     set_pane_color(
                         PaneId::Terminal(pane_id),
                         None,
                         Some("#273548".into()),
                     );
                 } else {
-                    // Flash OFF: reset background
                     set_pane_color(PaneId::Terminal(pane_id), None, None);
                 }
+            } else if session.flash_deadline > 0.0 {
+                // Flash just expired — reset blink residue
+                session.flash_deadline = 0.0;
+                if session.focus_highlight_deadline <= now {
+                    // No steady tint follows — fully clear
+                    session.focus_highlight_deadline = 0.0;
+                    set_pane_color(PaneId::Terminal(pane_id), None, None);
+                }
+                // else: steady tint will be applied by the next branch on next tick
             } else if session.focus_highlight_deadline > now {
-                // Steady tint (persist mode: blink ended, hold until UserPromptSubmit)
+                // Steady tint (persist mode)
                 set_pane_color(
                     PaneId::Terminal(pane_id),
                     None,
@@ -270,14 +285,21 @@ impl State {
                 && (now - session.last_event_ts) > done_timeout
             {
                 session.activity = Activity::Idle;
-                need_zjstatus_update = true;
                 // Reset background
                 set_pane_color(PaneId::Terminal(pane_id), None, None);
             } else if session.activity == Activity::Idle
                 && (now - session.last_event_ts) > idle_remove
             {
                 to_remove.push(pane_id);
-                need_zjstatus_update = true;
+            } else if session.activity.is_running()
+                && !session.activity.is_attention()
+                && (now - session.last_event_ts) > idle_remove
+            {
+                // Stale running session (no hook events for idle_remove_s)
+                // Conservative: only fires after 300s (default), well beyond
+                // any normal tool invocation gap.
+                session.activity = Activity::Done;
+                session.last_event_ts = now;
             }
         }
 
@@ -305,10 +327,6 @@ impl State {
             }
         }
 
-        if need_zjstatus_update {
-            self.update_zjstatus();
-        }
-
         let has_highlights = !self.focus_highlights.is_empty();
         let interval = if any_flash_active || has_highlights {
             0.1
@@ -318,21 +336,6 @@ impl State {
         set_timeout(interval);
 
         self.visible
-    }
-
-    fn update_zjstatus(&mut self) {
-        let now = self.uptime_s;
-        if (now - self.last_zjstatus_update) < 0.25 {
-            return;
-        }
-        self.last_zjstatus_update = now;
-
-        // Pipe status to zjstatus via CLI (same protocol as zellij pipe)
-        if self.config.zjstatus_pipe {
-            let status = state::format_zjstatus(&self.sessions);
-            let msg = format!("zjstatus::pipe::pipe_status::{}", status);
-            exec_cmd(&["zellij", "pipe", &msg]);
-        }
     }
 
     fn track_focus(&mut self) {
@@ -359,7 +362,6 @@ impl State {
                             // Clear attention activity on focus (acknowledged)
                             if session.activity.is_attention() {
                                 session.activity = Activity::Thinking;
-                                self.update_zjstatus();
                             }
                         }
                     }
@@ -385,26 +387,63 @@ impl State {
     }
 
     fn focus_starred_pane(&mut self, forward: bool) {
-        let pane_id = if forward {
-            self.stars.next()
-        } else {
-            self.stars.prev()
-        };
-        if let Some(pane_id) = pane_id {
-            for (&tab_idx, panes) in &self.pane_manifest {
-                for pane in panes {
-                    if pane.id == pane_id && !pane.is_plugin {
-                        let current_tab =
-                            self.tabs.iter().find(|t| t.active).map(|t| t.position);
-                        if current_tab != Some(tab_idx) {
-                            switch_tab_to(tab_idx as u32);
-                        }
-                        focus_terminal_pane(pane_id, false, false);
-                        return;
-                    }
+        // Close palette if open
+        if self.visible {
+            self.hide_palette();
+        }
+
+        // Build starred panes in display order (tab_index → pane_id), deduplicated
+        let mut seen = std::collections::HashSet::new();
+        let mut starred_ordered: Vec<(usize, u32)> = Vec::new();
+        for (&tab_idx, panes) in &self.pane_manifest {
+            for pane in panes {
+                if !pane.is_plugin && self.stars.contains(pane.id) && seen.insert(pane.id)
+                {
+                    starred_ordered.push((tab_idx, pane.id));
                 }
             }
         }
+        starred_ordered.sort_by_key(|&(tab, id)| (tab, id));
+
+        if starred_ordered.is_empty() {
+            return;
+        }
+
+        // Use last_starred_pane for consistent cycling (not current_focus_pane,
+        // which may not have updated yet from the previous focus call)
+        let cur_pos = self
+            .last_starred_pane
+            .and_then(|c| starred_ordered.iter().position(|&(_, id)| id == c));
+        let next_pos = match cur_pos {
+            Some(pos) => {
+                if forward {
+                    (pos + 1) % starred_ordered.len()
+                } else if pos == 0 {
+                    starred_ordered.len() - 1
+                } else {
+                    pos - 1
+                }
+            }
+            None => 0,
+        };
+
+        let (tab_idx, pane_id) = starred_ordered[next_pos];
+        self.last_starred_pane = Some(pane_id);
+
+        let current_tab = self.tabs.iter().find(|t| t.active).map(|t| t.position);
+        if current_tab != Some(tab_idx) {
+            switch_tab_to(tab_idx as u32);
+        }
+        focus_terminal_pane(pane_id, false, false);
+
+        // Background flash
+        self.focus_highlights
+            .insert(pane_id, self.uptime_s + self.config.focus_highlight_s);
+        set_pane_color(
+            PaneId::Terminal(pane_id),
+            None,
+            Some("#1a2535".into()),
+        );
     }
 
     fn confirm_selection(&mut self) {
@@ -432,6 +471,30 @@ impl State {
             }
             focus_terminal_pane(pane_id, false, false);
         }
+    }
+
+    fn handle_focus(&mut self, fp: FocusPayload) {
+        for (&tab_idx, panes) in &self.pane_manifest {
+            for pane in panes {
+                if pane.id == fp.pane_id && !pane.is_plugin {
+                    // Switch tab if needed
+                    let current_tab = self.tabs.iter().find(|t| t.active).map(|t| t.position);
+                    if current_tab != Some(tab_idx) {
+                        switch_tab_to(tab_idx as u32);
+                    }
+                    // Direct focus — O(1)
+                    focus_terminal_pane(fp.pane_id, false, false);
+                    // Flash effect via existing focus_highlights system
+                    let duration = fp.flash_duration_ms.unwrap_or(800) as f64 / 1000.0;
+                    self.focus_highlights
+                        .insert(fp.pane_id, self.uptime_s + duration);
+                    let color = fp.flash_color.as_deref().unwrap_or("#273548");
+                    set_pane_color(PaneId::Terminal(fp.pane_id), None, Some(color.into()));
+                    return;
+                }
+            }
+        }
+        eprintln!("pane-palette: focus pane {} not found in manifest", fp.pane_id);
     }
 
     fn handle_key(&mut self, key: KeyWithModifier) -> bool {
@@ -496,17 +559,10 @@ impl State {
                 }
 
                 // Number selection: 1-9 jump to Nth visible entry and confirm
-                if ch >= '1' && ch <= '9' {
+                // jump_targets is set by render() to match displayed numbers
+                if ('1'..='9').contains(&ch) {
                     let target = (ch as usize) - ('1' as usize);
-                    // Build visible indices (skip collapsed)
-                    let visible: Vec<usize> = self
-                        .filtered_entries
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, e)| !self.collapsed_tabs.contains(&e.tab_index))
-                        .map(|(i, _)| i)
-                        .collect();
-                    if let Some(&idx) = visible.get(target) {
+                    if let Some(&idx) = self.jump_targets.get(target) {
                         self.selected_index = idx;
                         self.confirm_selection();
                     }
