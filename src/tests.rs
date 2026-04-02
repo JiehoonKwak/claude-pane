@@ -342,13 +342,90 @@ fn test_attention_session_not_stale() {
 }
 
 // ---------------------------------------------------------------------------
-// Codex process detection
+// resolve_command — interpreter-aware argv parsing
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_codex_process_detection() {
-    assert!("codex".contains("codex"));
-    assert!(!"claude".contains("codex"));
-    assert!(!"zsh".contains("codex"));
-    assert!("codex-cli".contains("codex"));
+fn test_resolve_simple_binary() {
+    let argv = vec!["/usr/bin/nvim".into(), "file.rs".into()];
+    assert_eq!(crate::filter::resolve_command(&argv), Some("nvim".into()));
+}
+
+#[test]
+fn test_resolve_node_interpreter_codex() {
+    // fnm-managed codex: node /path/to/fnm/.../bin/codex resume
+    let argv = vec![
+        "node".into(),
+        "/Users/u/.local/state/fnm_multishells/57125/bin/codex".into(),
+        "resume".into(),
+    ];
+    assert_eq!(crate::filter::resolve_command(&argv), Some("codex".into()));
+}
+
+#[test]
+fn test_resolve_npx_codex() {
+    let argv = vec!["npx".into(), "--yes".into(), "codex".into()];
+    assert_eq!(crate::filter::resolve_command(&argv), Some("codex".into()));
+}
+
+#[test]
+fn test_resolve_python_script() {
+    let argv = vec!["python3".into(), "/path/to/send_event.py".into()];
+    assert_eq!(
+        crate::filter::resolve_command(&argv),
+        Some("send_event.py".into())
+    );
+}
+
+#[test]
+fn test_resolve_bare_command() {
+    let argv = vec!["lazygit".into()];
+    assert_eq!(
+        crate::filter::resolve_command(&argv),
+        Some("lazygit".into())
+    );
+}
+
+#[test]
+fn test_resolve_empty_argv() {
+    let argv: Vec<String> = vec![];
+    assert_eq!(crate::filter::resolve_command(&argv), None);
+}
+
+#[test]
+fn test_resolve_interpreter_no_args() {
+    // node with no script arg — falls back to "node"
+    let argv = vec!["node".into()];
+    assert_eq!(crate::filter::resolve_command(&argv), Some("node".into()));
+}
+
+#[test]
+fn test_resolve_interpreter_only_flags() {
+    // node --version — no script, falls back to "node"
+    let argv = vec!["node".into(), "--version".into()];
+    assert_eq!(crate::filter::resolve_command(&argv), Some("node".into()));
+}
+
+// ---------------------------------------------------------------------------
+// command_color — known command highlighting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_command_color_codex() {
+    assert_eq!(crate::render::command_color("codex"), Some("#10a37f"));
+}
+
+#[test]
+fn test_command_color_nvim() {
+    assert!(crate::render::command_color("nvim").is_some());
+}
+
+#[test]
+fn test_command_color_lazygit() {
+    assert!(crate::render::command_color("lazygit").is_some());
+}
+
+#[test]
+fn test_command_color_unknown() {
+    assert_eq!(crate::render::command_color("zsh"), None);
 }

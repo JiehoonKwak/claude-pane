@@ -1,5 +1,33 @@
 use crate::state::{PaneEntry, State};
 
+/// Resolve display name from a process argv.
+/// Handles interpreter wrappers: `node /path/to/codex` → "codex".
+pub fn resolve_command(argv: &[String]) -> Option<String> {
+    const INTERPRETERS: &[&str] = &[
+        "node", "python", "python3", "python2", "ruby", "perl", "deno", "bun", "npx",
+    ];
+
+    let first = argv.first()?;
+    let bin = first.rsplit('/').next().unwrap_or(first);
+
+    if INTERPRETERS.contains(&bin) {
+        for arg in &argv[1..] {
+            if arg.starts_with('-') {
+                continue;
+            }
+            let name = arg.rsplit('/').next().unwrap_or(arg);
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+
+    if bin.is_empty() {
+        return None;
+    }
+    Some(bin.to_string())
+}
+
 pub fn fuzzy_filter(query: &str, entries: Vec<PaneEntry>) -> Vec<PaneEntry> {
     use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
     use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32Str};
@@ -47,12 +75,9 @@ pub fn refresh_running_commands(state: &mut State) {
             if pane.is_plugin {
                 continue;
             }
-            if let Ok(cmd) = get_pane_running_command(PaneId::Terminal(pane.id)) {
-                if let Some(bin) = cmd.first() {
-                    let basename = bin.rsplit('/').next().unwrap_or(bin);
-                    state
-                        .running_command_cache
-                        .insert(pane.id, basename.to_string());
+            if let Ok(argv) = get_pane_running_command(PaneId::Terminal(pane.id)) {
+                if let Some(name) = resolve_command(&argv) {
+                    state.running_command_cache.insert(pane.id, name);
                 }
             }
         }

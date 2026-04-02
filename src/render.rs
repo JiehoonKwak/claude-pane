@@ -228,13 +228,13 @@ fn render_entry(
     cols: usize,
     jump_num: Option<u8>,
 ) {
-    let mut line = String::with_capacity(cols);
+    let mut line = String::with_capacity(cols * 3);
 
     if selected {
         line.push_str(REVERSE);
     }
 
-    // Jump number
+    // Jump number (2 visible cols)
     if let Some(n) = jump_num {
         line.push_str(&fg("#6c7086"));
         line.push_str(&format!("{:<2}", n));
@@ -246,7 +246,7 @@ fn render_entry(
         line.push_str("  ");
     }
 
-    // Star
+    // Star (2 visible cols)
     if entry.is_starred {
         line.push_str(&fg("#ffdc00"));
         line.push_str("\u{2605} "); // ★
@@ -258,7 +258,7 @@ fn render_entry(
         line.push_str("  ");
     }
 
-    // Activity symbol (if Claude session)
+    // Activity symbol (2 visible cols)
     if let Some(ref session) = entry.session {
         let color = session.activity.color();
         let sym = session.activity.symbol();
@@ -273,7 +273,7 @@ fn render_entry(
         line.push_str("  ");
     }
 
-    // Tab name (only in flat/search mode)
+    // Tab name in search mode (up to 15 visible cols: 12 name + " │ ")
     if show_tab {
         line.push_str(DIM);
         line.push_str(&truncate(&entry.tab_name, 12));
@@ -284,15 +284,18 @@ fn render_entry(
         line.push_str(" \u{2502} "); // │
     }
 
-    // Running command + title/project
-    let max_label = if show_tab { 24 } else { 30 };
+    // Dynamic width: remaining columns for command + label
+    let prefix_width = 2 + 2 + 2 + if show_tab { 15 } else { 0 };
+    let content_width = cols.saturating_sub(prefix_width);
+
     let cmd = entry.running_command.as_deref().unwrap_or("");
-    let is_codex = cmd.contains("codex");
     let is_claude = entry.session.is_some();
 
     if is_claude {
-        // Claude session: orange command when running
+        // Claude session
         let session = entry.session.as_ref().unwrap();
+        let elapsed_reserve = if state.config.show_elapsed_time { 5 } else { 0 };
+
         if !cmd.is_empty() {
             if session.activity.is_running() {
                 line.push_str(&fg("#ff851b"));
@@ -308,8 +311,12 @@ fn render_entry(
             line.push(' ');
         }
 
-        // Project name or title
         let label = session.project_name.as_deref().unwrap_or(&entry.title);
+        let cmd_used = if cmd.is_empty() { 0 } else { cmd.len() + 1 };
+        let label_width = content_width
+            .saturating_sub(cmd_used)
+            .saturating_sub(elapsed_reserve);
+
         if session.activity.is_running() {
             line.push_str(&fg("#ff851b"));
         }
@@ -318,13 +325,12 @@ fn render_entry(
         } else {
             line.push_str(BOLD);
         }
-        line.push_str(&truncate(label, max_label));
+        line.push_str(&truncate(label, label_width));
         line.push_str(RESET);
         if selected {
             line.push_str(REVERSE);
         }
 
-        // Elapsed time
         if state.config.show_elapsed_time {
             let elapsed = state.uptime_s - session.last_event_ts;
             if elapsed > 0.0 {
@@ -336,24 +342,11 @@ fn render_entry(
                 }
             }
         }
-    } else if is_codex {
-        // Codex pane: green command
-        line.push_str(&fg("#10a37f"));
-        line.push_str(BOLD);
-        line.push_str(cmd);
-        line.push_str(RESET);
-        if selected {
-            line.push_str(REVERSE);
-        }
-        line.push(' ');
-        line.push_str(DIM);
-        line.push_str(&truncate(&entry.title, max_label));
-        line.push_str(RESET);
     } else {
-        // Regular pane
-        let max_title: usize = if show_tab { 36 } else { 42 };
+        // Non-Claude pane (codex, nvim, lazygit, regular, etc.)
         if !cmd.is_empty() {
-            line.push_str(&fg("#a9b1d6"));
+            let color = command_color(cmd).unwrap_or("#a9b1d6");
+            line.push_str(&fg(color));
             line.push_str(BOLD);
             line.push_str(cmd);
             line.push_str(RESET);
@@ -361,24 +354,24 @@ fn render_entry(
                 line.push_str(REVERSE);
             }
             line.push(' ');
+            let title_width = content_width.saturating_sub(cmd.len() + 1);
             line.push_str(DIM);
-            line.push_str(&truncate(
-                &entry.title,
-                max_title.saturating_sub(cmd.len() + 1),
-            ));
+            line.push_str(&truncate(&entry.title, title_width));
             line.push_str(RESET);
         } else {
-            line.push_str(&truncate(&entry.title, max_title));
+            line.push_str(&truncate(&entry.title, content_width));
         }
     }
 
     line.push_str(RESET);
 
-    // Truncate to terminal width
-    println!("{}", &line[..line.len().min(cols * 4)]); // rough limit; ANSI codes inflate length
+    println!("{}", truncate_ansi(&line, cols));
 }
 
 fn truncate(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
     if s.chars().count() <= max {
         s.to_string()
     } else {
@@ -386,4 +379,43 @@ fn truncate(s: &str, max: usize) -> String {
         t.push('\u{2026}'); // …
         t
     }
+}
+
+/// Highlight color for known commands. None = default color.
+pub fn command_color(cmd: &str) -> Option<&'static str> {
+    match cmd {
+        "codex" | "codex-cli" => Some("#10a37f"),
+        "nvim" | "vim" | "vi" | "helix" | "hx" => Some("#57a143"),
+        "lazygit" | "lazydocker" | "gitui" => Some("#e06c75"),
+        "htop" | "btop" | "top" => Some("#e5c07b"),
+        _ => None,
+    }
+}
+
+/// Truncate an ANSI-coded string to max_visible display columns.
+fn truncate_ansi(s: &str, max_visible: usize) -> String {
+    let mut visible = 0;
+    let mut in_escape = false;
+    let mut result = String::with_capacity(s.len());
+
+    for ch in s.chars() {
+        if ch == '\x1b' {
+            in_escape = true;
+            result.push(ch);
+        } else if in_escape {
+            result.push(ch);
+            if ch.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else {
+            if visible >= max_visible {
+                result.push_str(RESET);
+                return result;
+            }
+            result.push(ch);
+            visible += 1;
+        }
+    }
+
+    result
 }
